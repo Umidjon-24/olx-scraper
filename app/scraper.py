@@ -14,11 +14,11 @@ from playwright.async_api import async_playwright
 # ─────────────────────────────────────────────────────────────────
 # TIMING PROFILES  (human-like, not too slow)
 # ─────────────────────────────────────────────────────────────────
-AD_WAIT_MS       = (1800, 3500)
-BETWEEN_ADS      = (2.0, 4.0)
-BETWEEN_LIST     = (4.0, 8.0)
-LONG_BREAK_EVERY = 15
-LONG_BREAK_SECS  = (10, 15)
+AD_WAIT_MS       = (800, 1500)
+BETWEEN_ADS      = (1.0, 2.0)
+BETWEEN_LIST     = (2.0, 4.0)
+LONG_BREAK_EVERY = 50
+LONG_BREAK_SECS  = (5, 8)
 SCROLL_PASSES    = (2, 3)
 SCROLL_DIST_PX   = (500, 1200)
 SCROLL_PAUSE     = (0.4, 0.9)
@@ -130,9 +130,34 @@ async def get_list_container_attrs(page) -> dict:
 
 async def scrape_ad(page, url: str) -> dict | None:
     try:
+        # Intercept OLX statistics API to capture view count
+        views_holder: dict = {"value": None}
+
+        async def handle_response(response):
+            try:
+                if "statistics" in response.url and response.status == 200:
+                    data = await response.json()
+                    # OLX returns {"data": {"statistics": {"page_views": {"sum": N}}}}
+                    v = (
+                        data.get("data", {})
+                            .get("statistics", {})
+                            .get("page_views", {})
+                            .get("sum")
+                    )
+                    if v is not None:
+                        views_holder["value"] = int(v)
+            except Exception:
+                pass
+
+        page.on("response", handle_response)
+
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(random.randint(*AD_WAIT_MS))
         await human_scroll(page)
+
+        # Give the stats API a moment to respond
+        await asyncio.sleep(1.5)
+        page.remove_listener("response", handle_response)
 
         page_title = await page.title()
         if any(x in page_title.lower() for x in ["403", "access denied", "captcha", "just a moment"]):
@@ -242,14 +267,8 @@ async def scrape_ad(page, url: str) -> dict | None:
             except Exception:
                 pass
 
-        # 5. Views
-        views = None
-        try:
-            views_loc = page.locator('[data-testid="page-view-counter"]')
-            if await views_loc.count() > 0:
-                views = extract_number(await views_loc.first.inner_text())
-        except Exception:
-            pass
+        # 5. Views — captured from OLX statistics API response
+        views = views_holder["value"]
 
         # 6. Posted date
         posted_date = None
@@ -386,6 +405,63 @@ async def scrape_ad(page, url: str) -> dict | None:
 # MAIN ENTRY POINT
 # ─────────────────────────────────────────────────────────────────
 
+BROWSER_RESTART_EVERY = 50  # restart browser every N listings to free memory
+
+CHROMIUM_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-setuid-sandbox",
+    "--single-process",
+    "--no-zygote",
+    "--disable-accelerated-2d-canvas",
+    "--disable-web-security",
+    # Memory saving flags
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-default-apps",
+    "--disable-sync",
+    "--disable-translate",
+    "--hide-scrollbars",
+    "--metrics-recording-only",
+    "--mute-audio",
+    "--no-first-run",
+    "--safebrowsing-disable-auto-update",
+    "--js-flags=--max-old-space-size=256",
+]
+
+
+async def make_browser_page(p):
+    """Launch a fresh browser + context + page with aggressive resource blocking."""
+    browser = await p.chromium.launch(headless=True, slow_mo=0, args=CHROMIUM_ARGS)
+    context = await browser.new_context(
+        viewport={"width": 800, "height": 600},  # smaller viewport = less memory
+        locale="ru-RU",
+        timezone_id="Asia/Tashkent",
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+    )
+    page = await context.new_page()
+
+    # Block images, fonts, media — we only need HTML text
+    # Allow XHR/fetch (needed for OLX statistics API that returns view counts)
+    await page.route("**/*", lambda route: route.abort()
+        if route.request.resource_type in ["image", "media", "font", "stylesheet"]
+        else route.continue_()
+    )
+
+    await page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        window.chrome = { runtime: {} };
+        Object.defineProperty(navigator, 'plugins',   { get: () => [1,2,3,4,5] });
+        Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU','ru','en-US'] });
+    """)
+    return browser, page
+
+
 async def run_scraper(base_url: str, max_pages: int) -> list[dict]:
     """
     Run the full scrape and return a list of listing dicts.
@@ -394,52 +470,33 @@ async def run_scraper(base_url: str, max_pages: int) -> list[dict]:
     all_data: list[dict] = []
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            slow_mo=80,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-setuid-sandbox",
-                "--single-process",
-                "--no-zygote",
-                "--disable-accelerated-2d-canvas",
-                "--disable-web-security",
-            ],
-        )
-        context = await browser.new_context(
-            viewport={"width": 1400, "height": 900},
-            locale="ru-RU",
-            timezone_id="Asia/Tashkent",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        )
-        page = await context.new_page()
 
-        await page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            window.chrome = { runtime: {} };
-            Object.defineProperty(navigator, 'plugins',   { get: () => [1,2,3,4,5] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU','ru','en-US'] });
-        """)
-
-        # Warm-up
+        # ── Step 1: collect all listing links ──
+        browser, page = await make_browser_page(p)
         print("WARMING SESSION...")
         await page.goto("https://www.olx.uz/", wait_until="domcontentloaded")
         await short_delay(3, 5)
         await human_scroll(page, fast=True)
 
-        # Collect links
         all_links = await get_all_links(page, base_url, max_pages)
         all_links = list(set(all_links))
         print(f"\nTOTAL UNIQUE LINKS: {len(all_links)}")
+        await browser.close()
 
-        # Scrape each ad
+        # ── Step 2: scrape each ad, restarting browser every N listings ──
+        browser, page = await make_browser_page(p)
+
         for idx, link in enumerate(all_links, start=1):
+            # Restart browser every BROWSER_RESTART_EVERY listings
+            if idx > 1 and (idx - 1) % BROWSER_RESTART_EVERY == 0:
+                print(f"\n  ── restarting browser at listing {idx} to free memory ──\n")
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                await asyncio.sleep(3)
+                browser, page = await make_browser_page(p)
+
             print(f"[{idx}/{len(all_links)}] {link.split('/')[-1]}")
             data = await scrape_ad(page, link)
             if data:
@@ -455,6 +512,9 @@ async def run_scraper(base_url: str, max_pages: int) -> list[dict]:
                 print(f"\n  ── pause {secs:.0f}s ──\n")
                 await asyncio.sleep(secs)
 
-        await browser.close()
+        try:
+            await browser.close()
+        except Exception:
+            pass
 
     return all_data
