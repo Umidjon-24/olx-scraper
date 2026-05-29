@@ -76,8 +76,8 @@ async def get_all_links(page, base_url: str, max_pages: int) -> list[str]:
         url = page_url(base_url, pg)
         print(f"── LIST PAGE {pg}/{max_pages}: {url}")
 
-        await page.goto(url, wait_until="networkidle", timeout=60000)
-        await page.wait_for_timeout(random.randint(2000, 4000))
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(random.randint(3000, 5000))
         await human_scroll(page)
 
         hrefs = await page.locator("a").evaluate_all(
