@@ -14,11 +14,11 @@ from playwright.async_api import async_playwright
 # ─────────────────────────────────────────────────────────────────
 # TIMING PROFILES  (human-like, not too slow)
 # ─────────────────────────────────────────────────────────────────
-AD_WAIT_MS       = (800, 1500)
-BETWEEN_ADS      = (1.0, 2.0)
-BETWEEN_LIST     = (2.0, 4.0)
+AD_WAIT_MS       = (1500, 3000)
+BETWEEN_ADS      = (1.5, 3.0)
+BETWEEN_LIST     = (4.0, 7.0)
 LONG_BREAK_EVERY = 50
-LONG_BREAK_SECS  = (5, 8)
+LONG_BREAK_SECS  = (8, 12)
 SCROLL_PASSES    = (2, 3)
 SCROLL_DIST_PX   = (500, 1200)
 SCROLL_PAUSE     = (0.4, 0.9)
@@ -76,19 +76,33 @@ async def get_all_links(page, base_url: str, max_pages: int) -> list[str]:
         url = page_url(base_url, pg)
         print(f"── LIST PAGE {pg}/{max_pages}: {url}")
 
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(random.randint(3000, 5000))
-        await human_scroll(page)
+        # Retry up to 3 times on 403
+        for attempt in range(3):
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(random.randint(3000, 5000))
+            await human_scroll(page)
 
-        hrefs = await page.locator("a").evaluate_all(
-            "elements => elements.map(e => e.href)"
-        )
-        before = len(all_links)
-        for href in hrefs:
-            if href and "/d/obyavlenie/" in href:
-                all_links.add(href.split("?")[0])
+            page_title = (await page.title()).lower()
+            body_text = (await page.text_content("body") or "").lower()
 
-        print(f"   +{len(all_links) - before} new  (total {len(all_links)})")
+            if "403" in page_title or "access denied" in body_text or "captcha" in body_text:
+                wait_secs = (attempt + 1) * 15
+                print(f"   ✗ 403 ERROR — waiting {wait_secs}s before retry {attempt+1}/3")
+                await asyncio.sleep(wait_secs)
+                continue
+
+            # Success — extract links
+            hrefs = await page.locator("a").evaluate_all(
+                "elements => elements.map(e => e.href)"
+            )
+            before = len(all_links)
+            for href in hrefs:
+                if href and "/d/obyavlenie/" in href:
+                    all_links.add(href.split("?")[0])
+            print(f"   +{len(all_links) - before} new  (total {len(all_links)})")
+            break
+        else:
+            print(f"   ✗ Skipping page {pg} after 3 failed attempts")
 
         if pg < max_pages:
             await short_delay(*BETWEEN_LIST)
@@ -161,7 +175,8 @@ async def scrape_ad(page, url: str) -> dict | None:
 
         page_title = await page.title()
         if any(x in page_title.lower() for x in ["403", "access denied", "captcha", "just a moment"]):
-            print(f"  BLOCKED: {url}")
+            print(f"  BLOCKED (403) — waiting 20s and skipping")
+            await asyncio.sleep(20)
             return None
 
         # 1. Listing ID
