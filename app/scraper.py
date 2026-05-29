@@ -397,7 +397,16 @@ async def run_scraper(base_url: str, max_pages: int) -> list[dict]:
         browser = await p.chromium.launch(
             headless=True,
             slow_mo=80,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-setuid-sandbox",
+                "--single-process",
+                "--no-zygote",
+                "--disable-accelerated-2d-canvas",
+                "--disable-web-security",
+            ],
         )
         context = await browser.new_context(
             viewport={"width": 1400, "height": 900},
