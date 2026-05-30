@@ -1,14 +1,33 @@
 """
-OLX scraper — adapted from olx.ipynb.
+OLX scraper — Railway production version.
+Merged from working Colab version with all improvements.
 Uses Playwright (async) to scrape apartment listings from olx.uz.
 """
 
 import asyncio
 import random
 import re
+import os
 from datetime import datetime
 
+import pandas as pd
 from playwright.async_api import async_playwright
+from sqlalchemy import create_engine
+
+
+# ─────────────────────────────────────────────────────────────────
+# CONFIG & DATABASE CONFIG
+# ─────────────────────────────────────────────────────────────────
+BASE_URL   = "https://www.olx.uz/nedvizhimost/kvartiry/prodazha/?currency=UZS"
+MAX_PAGES  = 25
+BATCH_SIZE = 15  # Save to database every 15 ads
+
+DB_USER  = os.environ.get("DB_USER")
+DB_PASS  = os.environ.get("DB_PASS")
+DB_HOST  = os.environ.get("DB_HOST")
+DB_PORT  = os.environ.get("DB_PORT", "5432")
+DB_NAME  = os.environ.get("DB_NAME", "postgres")
+TABLE_NAME = "listings"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -16,12 +35,36 @@ from playwright.async_api import async_playwright
 # ─────────────────────────────────────────────────────────────────
 AD_WAIT_MS       = (1500, 3000)
 BETWEEN_ADS      = (1.5, 3.0)
-BETWEEN_LIST     = (4.0, 7.0)
+BETWEEN_LIST     = (6.0, 8.0)
 LONG_BREAK_EVERY = 50
 LONG_BREAK_SECS  = (8, 12)
 SCROLL_PASSES    = (2, 3)
 SCROLL_DIST_PX   = (500, 1200)
 SCROLL_PAUSE     = (0.4, 0.9)
+
+BROWSER_RESTART_EVERY = 50  # restart browser every N listings to free memory
+
+CHROMIUM_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-setuid-sandbox",
+    "--single-process",
+    "--no-zygote",
+    "--disable-accelerated-2d-canvas",
+    "--disable-web-security",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-default-apps",
+    "--disable-sync",
+    "--disable-translate",
+    "--hide-scrollbars",
+    "--metrics-recording-only",
+    "--mute-audio",
+    "--no-first-run",
+    "--safebrowsing-disable-auto-update",
+    "--js-flags=--max-old-space-size=256",
+]
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -61,6 +104,64 @@ async def human_scroll(page, fast: bool = False) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────
+# DATABASE
+# ─────────────────────────────────────────────────────────────────
+
+def save_batch_to_db(data_list: list[dict], engine) -> None:
+    if not data_list:
+        return
+    df = pd.DataFrame(data_list)
+    col_order = [
+        "listing_id", "title", "price", "currency", "area", "num_rooms", "market_type",
+        "views", "stair", "posted_date", "scraped_date", "negotiation",
+        "seller", "location", "seller_joined", "description", "url"
+    ]
+    df = df[[c for c in col_order if c in df.columns]]
+    try:
+        df.to_sql(TABLE_NAME, engine, if_exists="append", index=False)
+        print(f"\n  [DATABASE] ✓ {len(df)} listings saved to '{TABLE_NAME}'.")
+    except Exception as e:
+        print(f"\n  [DATABASE ERROR] ✗ Failed to save batch: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────
+# BROWSER FACTORY
+# ─────────────────────────────────────────────────────────────────
+
+async def make_browser_page(p):
+    """Launch a fresh browser + context + page with aggressive resource blocking."""
+    browser = await p.chromium.launch(headless=True, slow_mo=0, args=CHROMIUM_ARGS)
+    context = await browser.new_context(
+        viewport={"width": 800, "height": 600},  # smaller viewport = less memory
+        locale="ru-RU",
+        timezone_id="Asia/Tashkent",
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+    )
+    page = await context.new_page()
+
+    # Block images, fonts, media — we only need HTML text
+    # Allow XHR/fetch (needed for OLX statistics API that returns view counts)
+    await page.route(
+        "**/*",
+        lambda route: route.abort()
+        if route.request.resource_type in ["image", "media", "font", "stylesheet"]
+        else route.continue_(),
+    )
+
+    await page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        window.chrome = { runtime: {} };
+        Object.defineProperty(navigator, 'plugins',   { get: () => [1,2,3,4,5] });
+        Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU','ru','en-US'] });
+    """)
+    return browser, page
+
+
+# ─────────────────────────────────────────────────────────────────
 # LINK COLLECTION
 # ─────────────────────────────────────────────────────────────────
 
@@ -83,7 +184,7 @@ async def get_all_links(page, base_url: str, max_pages: int) -> list[str]:
             await human_scroll(page)
 
             page_title = (await page.title()).lower()
-            body_text = (await page.text_content("body") or "").lower()
+            body_text  = (await page.text_content("body") or "").lower()
 
             if "403" in page_title or "access denied" in body_text or "captcha" in body_text:
                 wait_secs = (attempt + 1) * 15
@@ -91,7 +192,6 @@ async def get_all_links(page, base_url: str, max_pages: int) -> list[str]:
                 await asyncio.sleep(wait_secs)
                 continue
 
-            # Success — extract links
             hrefs = await page.locator("a").evaluate_all(
                 "elements => elements.map(e => e.href)"
             )
@@ -120,7 +220,7 @@ async def get_list_container_attrs(page) -> dict:
         container = page.locator('[data-nx-name="ListContainer"]')
         if await container.count() == 0:
             return attrs
-        rows = container.locator("li, p")
+        rows  = container.locator("li, p")
         count = await rows.count()
         for i in range(count):
             row_text = clean(await rows.nth(i).inner_text())
@@ -151,7 +251,6 @@ async def scrape_ad(page, url: str) -> dict | None:
             try:
                 if "statistics" in response.url and response.status == 200:
                     data = await response.json()
-                    # OLX returns {"data": {"statistics": {"page_views": {"sum": N}}}}
                     v = (
                         data.get("data", {})
                             .get("statistics", {})
@@ -175,7 +274,7 @@ async def scrape_ad(page, url: str) -> dict | None:
 
         page_title = await page.title()
         if any(x in page_title.lower() for x in ["403", "access denied", "captcha", "just a moment"]):
-            print(f"  BLOCKED (403) — waiting 20s and skipping")
+            print("  BLOCKED (403) — waiting 20s and skipping")
             await asyncio.sleep(20)
             return None
 
@@ -217,10 +316,10 @@ async def scrape_ad(page, url: str) -> dict | None:
             title = clean(page_title.split(":")[0])
 
         # 3. Price & currency
-        price = None
+        price    = None
         currency = None
         try:
-            price_loc = page.locator('[data-testid="ad-price-container"]')
+            price_loc  = page.locator('[data-testid="ad-price-container"]')
             price_text = ""
             if await price_loc.count() > 0:
                 price_text = clean(await price_loc.first.inner_text()) or ""
@@ -254,6 +353,7 @@ async def scrape_ad(page, url: str) -> dict | None:
         market_type = clean(market_raw)
         stair       = clean(stair_raw)
 
+        # Body text fallback for missing attrs
         if not all([area, num_rooms, stair]):
             try:
                 bt = clean(await page.text_content("body")) or ""
@@ -369,7 +469,7 @@ async def scrape_ad(page, url: str) -> dict | None:
         except Exception:
             pass
 
-        # 12. Description fallback
+        # 12. Description fallback for missing fields
         if description:
             desc_low = description.lower()
             if not area:
@@ -403,6 +503,7 @@ async def scrape_ad(page, url: str) -> dict | None:
             "views":         views,
             "stair":         stair,
             "posted_date":   posted_date,
+            "scraped_date":  now_str(),
             "negotiation":   negotiation,
             "seller":        seller,
             "location":      location,
@@ -417,72 +518,21 @@ async def scrape_ad(page, url: str) -> dict | None:
 
 
 # ─────────────────────────────────────────────────────────────────
-# MAIN ENTRY POINT
+# MAIN
 # ─────────────────────────────────────────────────────────────────
 
-BROWSER_RESTART_EVERY = 50  # restart browser every N listings to free memory
+async def main():
+    # 1. Initialize Database Engine
+    db_url = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    try:
+        engine = create_engine(db_url)
+        print("Database engine initialized.")
+    except Exception as e:
+        print(f"FATAL DB ERROR: Could not connect to DB. Check credentials. {e}")
+        return
 
-CHROMIUM_ARGS = [
-    "--no-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-gpu",
-    "--disable-setuid-sandbox",
-    "--single-process",
-    "--no-zygote",
-    "--disable-accelerated-2d-canvas",
-    "--disable-web-security",
-    # Memory saving flags
-    "--disable-extensions",
-    "--disable-background-networking",
-    "--disable-default-apps",
-    "--disable-sync",
-    "--disable-translate",
-    "--hide-scrollbars",
-    "--metrics-recording-only",
-    "--mute-audio",
-    "--no-first-run",
-    "--safebrowsing-disable-auto-update",
-    "--js-flags=--max-old-space-size=256",
-]
-
-
-async def make_browser_page(p):
-    """Launch a fresh browser + context + page with aggressive resource blocking."""
-    browser = await p.chromium.launch(headless=True, slow_mo=0, args=CHROMIUM_ARGS)
-    context = await browser.new_context(
-        viewport={"width": 800, "height": 600},  # smaller viewport = less memory
-        locale="ru-RU",
-        timezone_id="Asia/Tashkent",
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-    )
-    page = await context.new_page()
-
-    # Block images, fonts, media — we only need HTML text
-    # Allow XHR/fetch (needed for OLX statistics API that returns view counts)
-    await page.route("**/*", lambda route: route.abort()
-        if route.request.resource_type in ["image", "media", "font", "stylesheet"]
-        else route.continue_()
-    )
-
-    await page.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        window.chrome = { runtime: {} };
-        Object.defineProperty(navigator, 'plugins',   { get: () => [1,2,3,4,5] });
-        Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU','ru','en-US'] });
-    """)
-    return browser, page
-
-
-async def run_scraper(base_url: str, max_pages: int) -> list[dict]:
-    """
-    Run the full scrape and return a list of listing dicts.
-    Called by the scheduler and the /scraper/run endpoint.
-    """
-    all_data: list[dict] = []
+    batch_data: list[dict] = []
+    ad_counter = 0
 
     async with async_playwright() as p:
 
@@ -493,7 +543,7 @@ async def run_scraper(base_url: str, max_pages: int) -> list[dict]:
         await short_delay(3, 5)
         await human_scroll(page, fast=True)
 
-        all_links = await get_all_links(page, base_url, max_pages)
+        all_links = await get_all_links(page, BASE_URL, MAX_PAGES)
         all_links = list(set(all_links))
         print(f"\nTOTAL UNIQUE LINKS: {len(all_links)}")
         await browser.close()
@@ -502,7 +552,9 @@ async def run_scraper(base_url: str, max_pages: int) -> list[dict]:
         browser, page = await make_browser_page(p)
 
         for idx, link in enumerate(all_links, start=1):
-            # Restart browser every BROWSER_RESTART_EVERY listings
+            ad_counter += 1
+
+            # Restart browser every BROWSER_RESTART_EVERY listings to free memory
             if idx > 1 and (idx - 1) % BROWSER_RESTART_EVERY == 0:
                 print(f"\n  ── restarting browser at listing {idx} to free memory ──\n")
                 try:
@@ -512,17 +564,23 @@ async def run_scraper(base_url: str, max_pages: int) -> list[dict]:
                 await asyncio.sleep(3)
                 browser, page = await make_browser_page(p)
 
-            print(f"[{idx}/{len(all_links)}] {link.split('/')[-1]}")
+            print(f"[{idx}/{len(all_links)} | Total: {ad_counter}] {link.split('/')[-1]}")
             data = await scrape_ad(page, link)
+
             if data:
-                all_data.append(data)
-                print(f"  ✓ {(data['title'] or '')[:50]}")
+                batch_data.append(data)
+                print(f"  ✓ ID={data['listing_id']} | {(data['title'] or '')[:50]}")
             else:
                 print("  ✗ skipped")
 
+            # Flush batch to DB every BATCH_SIZE listings
+            if len(batch_data) >= BATCH_SIZE:
+                save_batch_to_db(batch_data, engine)
+                batch_data.clear()
+
             await short_delay(*BETWEEN_ADS)
 
-            if idx % LONG_BREAK_EVERY == 0:
+            if ad_counter % LONG_BREAK_EVERY == 0:
                 secs = random.uniform(*LONG_BREAK_SECS)
                 print(f"\n  ── pause {secs:.0f}s ──\n")
                 await asyncio.sleep(secs)
@@ -532,4 +590,12 @@ async def run_scraper(base_url: str, max_pages: int) -> list[dict]:
         except Exception:
             pass
 
-    return all_data
+    # Final flush for any remaining items
+    if batch_data:
+        save_batch_to_db(batch_data, engine)
+
+    print(f"\n{'='*50}\nSCRAPE COMPLETE. {ad_counter} ads processed.\n{'='*50}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
