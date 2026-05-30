@@ -22,12 +22,10 @@ BASE_URL   = "https://www.olx.uz/nedvizhimost/kvartiry/prodazha/?currency=UZS"
 MAX_PAGES  = 25
 BATCH_SIZE = 15  # Save to database every 15 ads
 
-DB_USER  = os.environ.get("DB_USER")
-DB_PASS  = os.environ.get("DB_PASS")
-DB_HOST  = os.environ.get("DB_HOST")
-DB_PORT  = os.environ.get("DB_PORT", "5432")
-DB_NAME  = os.environ.get("DB_NAME", "postgres")
-TABLE_NAME = "listings"
+# Railway automatically injects DATABASE_URL when you link a Postgres service.
+# Go to your service → Variables tab and confirm DATABASE_URL is present.
+DATABASE_URL = os.environ.get("DATABASE_URL")
+TABLE_NAME   = "listings"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -129,10 +127,10 @@ def save_batch_to_db(data_list: list[dict], engine) -> None:
 # ─────────────────────────────────────────────────────────────────
 
 async def make_browser_page(p):
-    """Launch a fresh browser + context + page with aggressive resource blocking."""
-    browser = await p.chromium.launch(headless=True, slow_mo=0, args=CHROMIUM_ARGS)
+    """Launch a fresh browser + context + page matching the working Colab setup."""
+    browser = await p.chromium.launch(headless=True, slow_mo=80, args=CHROMIUM_ARGS)
     context = await browser.new_context(
-        viewport={"width": 800, "height": 600},  # smaller viewport = less memory
+        viewport={"width": 1400, "height": 900},
         locale="ru-RU",
         timezone_id="Asia/Tashkent",
         user_agent=(
@@ -143,14 +141,8 @@ async def make_browser_page(p):
     )
     page = await context.new_page()
 
-    # Block images, fonts, media — we only need HTML text
-    # Allow XHR/fetch (needed for OLX statistics API that returns view counts)
-    await page.route(
-        "**/*",
-        lambda route: route.abort()
-        if route.request.resource_type in ["image", "media", "font", "stylesheet"]
-        else route.continue_(),
-    )
+    # No resource blocking — OLX anti-bot detects abnormal requests
+    # when images/CSS are missing and responds with 403
 
     await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -523,12 +515,14 @@ async def scrape_ad(page, url: str) -> dict | None:
 
 async def main():
     # 1. Initialize Database Engine
-    db_url = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    if not DATABASE_URL:
+        print("FATAL DB ERROR: DATABASE_URL environment variable is not set.")
+        return
     try:
-        engine = create_engine(db_url)
+        engine = create_engine(DATABASE_URL)
         print("Database engine initialized.")
     except Exception as e:
-        print(f"FATAL DB ERROR: Could not connect to DB. Check credentials. {e}")
+        print(f"FATAL DB ERROR: Could not connect to DB. {e}")
         return
 
     batch_data: list[dict] = []
