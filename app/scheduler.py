@@ -14,7 +14,7 @@ def job():
 # SCRAPE_HOUR and SCRAPE_MINUTE are Tashkent time (UTC+5)
 # Convert to UTC by subtracting 5 hours
 scrape_hour_tashkent   = int(os.environ.get("SCRAPE_HOUR", "10"))
-scrape_minute_tashkent = int(os.environ.get("SCRAPE_MINUTE", "15"))
+scrape_minute_tashkent = int(os.environ.get("SCRAPE_MINUTE", "50"))
 
 utc_hour   = (scrape_hour_tashkent - 5) % 24
 utc_minute = scrape_minute_tashkent
