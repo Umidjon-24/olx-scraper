@@ -16,13 +16,11 @@ async def init():
     print("Tables ready.")
 
 
+"""
+start.py — Railway entry point.
+Runs the scheduler which triggers the scraper daily.
+To trigger an immediate manual scrape, run: python -m app.scraper
+"""
+
 if __name__ == "__main__":
-    asyncio.run(init())
-    sys.exit(
-        subprocess.call([
-            "uvicorn", "app.main:app",
-            "--host", "0.0.0.0",
-            "--port", "8000",
-            "--reload",
-        ])
-    )
+    subprocess.run([sys.executable, "scheduler.py"])
