@@ -16,37 +16,36 @@ from sqlalchemy import create_engine
 
 
 # ─────────────────────────────────────────────────────────────────
-# CONFIG & DATABASE CONFIG
+# CONFIG
 # ─────────────────────────────────────────────────────────────────
 BASE_URL   = "https://www.olx.uz/nedvizhimost/kvartiry/prodazha/?currency=UZS"
 MAX_PAGES  = 25
 BATCH_SIZE = 15  # Save to database every 15 ads
 
-# Railway automatically injects DATABASE_URL when you link a Postgres service.
-# Go to your service → Variables tab and confirm DATABASE_URL is present.
+# ── Supabase connection pooler ────────────────────────────────────
+# Set these as environment variables in Railway → Variables tab.
+# Never hardcode credentials in source code.
 DB_USER = os.environ.get("DB_USER", "postgres.kaowfkjtwxeywtikpopw")
-DB_PASS = os.environ.get("DB_PASS")
+DB_PASS = os.environ.get("DB_PASS")          # REQUIRED — set in Railway
 DB_HOST = "aws-1-ap-northeast-1.pooler.supabase.com"
 DB_PORT = "5432"
 DB_NAME = "postgres"
-
-DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-TABLE_NAME   = "railway_listing"
+TABLE_NAME = "olx_listings"
 
 
 # ─────────────────────────────────────────────────────────────────
-# TIMING PROFILES  (human-like, not too slow)
+# TIMING PROFILES  ← restored to working Colab values
 # ─────────────────────────────────────────────────────────────────
-AD_WAIT_MS       = (1500, 3000)
-BETWEEN_ADS      = (1.5, 3.0)
-BETWEEN_LIST     = (6.0, 8.0)
-LONG_BREAK_EVERY = 50
-LONG_BREAK_SECS  = (8, 12)
+AD_WAIT_MS       = (1800, 3500)   # wait after loading each ad page
+BETWEEN_ADS      = (2.0, 4.0)    # pause between individual ads
+BETWEEN_LIST     = (4.0, 8.0)    # pause between listing pages
+LONG_BREAK_EVERY = 15             # take a long break every N ads
+LONG_BREAK_SECS  = (10, 15)      # duration of that long break
 SCROLL_PASSES    = (2, 3)
 SCROLL_DIST_PX   = (500, 1200)
 SCROLL_PAUSE     = (0.4, 0.9)
 
-BROWSER_RESTART_EVERY = 50  # restart browser every N listings to free memory
+BROWSER_RESTART_EVERY = 50        # restart browser every N listings to free memory
 
 CHROMIUM_ARGS = [
     "--no-sandbox",
@@ -111,14 +110,26 @@ async def human_scroll(page, fast: bool = False) -> None:
 # DATABASE
 # ─────────────────────────────────────────────────────────────────
 
+def get_engine():
+    """Build SQLAlchemy engine from Supabase pooler credentials."""
+    if not DB_PASS:
+        raise RuntimeError(
+            "DB_PASS environment variable is not set. "
+            "Add it in Railway → your service → Variables tab."
+        )
+    db_url = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    return create_engine(db_url)
+
+
 def save_batch_to_db(data_list: list[dict], engine) -> None:
+    """Appends a batch of listings to Supabase Postgres (no deduplication by design)."""
     if not data_list:
         return
     df = pd.DataFrame(data_list)
     col_order = [
-        "listing_id", "title", "price", "currency", "area", "num_rooms", "market_type",
-        "views", "stair", "posted_date", "scraped_date", "negotiation",
-        "seller", "location", "seller_joined", "description", "url"
+        "listing_id", "title", "price", "currency", "area", "num_rooms",
+        "market_type", "views", "stair", "posted_date", "scraped_date",
+        "negotiation", "seller", "location", "seller_joined", "description", "url"
     ]
     df = df[[c for c in col_order if c in df.columns]]
     try:
@@ -133,7 +144,7 @@ def save_batch_to_db(data_list: list[dict], engine) -> None:
 # ─────────────────────────────────────────────────────────────────
 
 async def make_browser_page(p):
-    """Launch a fresh browser + context + page matching the working Colab setup."""
+    """Launch a fresh browser + context + page."""
     browser = await p.chromium.launch(headless=True, slow_mo=80, args=CHROMIUM_ARGS)
     context = await browser.new_context(
         viewport={"width": 1400, "height": 900},
@@ -147,9 +158,7 @@ async def make_browser_page(p):
     )
     page = await context.new_page()
 
-    # No resource blocking — OLX anti-bot detects abnormal requests
-    # when images/CSS are missing and responds with 403
-
+    # Anti-detection — matches Colab working version
     await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         window.chrome = { runtime: {} };
@@ -177,7 +186,8 @@ async def get_all_links(page, base_url: str, max_pages: int) -> list[str]:
 
         # Retry up to 3 times on 403
         for attempt in range(3):
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            # ✅ networkidle — critical for lazy-loaded ad cards (same as working Colab)
+            await page.goto(url, wait_until="networkidle", timeout=60000)
             await page.wait_for_timeout(random.randint(3000, 5000))
             await human_scroll(page)
 
@@ -516,27 +526,33 @@ async def scrape_ad(page, url: str) -> dict | None:
 
 
 # ─────────────────────────────────────────────────────────────────
-# MAIN
+# MAIN SCRAPE FUNCTION  (called by scheduler.py or directly)
 # ─────────────────────────────────────────────────────────────────
 
-async def main():
-    # 1. Initialize Database Engine
-    if not DATABASE_URL:
-        print("FATAL DB ERROR: DATABASE_URL environment variable is not set.")
-        return
+async def run_scrape():
+    """
+    Main entry point for a full scrape run.
+    Called by scheduler.py for daily cron, or by __main__ for manual runs.
+    Returns total number of listings saved.
+    """
+    print(f"\n{'='*55}")
+    print(f"  SCRAPE STARTED  —  {now_str()}")
+    print(f"{'='*55}\n")
+
+    # Initialize DB engine
     try:
-        engine = create_engine(DATABASE_URL)
-        print("Database engine initialized.")
+        engine = get_engine()
+        print("✓ Database engine initialized (Supabase pooler).")
     except Exception as e:
-        print(f"FATAL DB ERROR: Could not connect to DB. {e}")
-        return
+        print(f"FATAL DB ERROR: {e}")
+        return 0
 
     batch_data: list[dict] = []
     ad_counter = 0
 
     async with async_playwright() as p:
 
-        # ── Step 1: collect all listing links ──
+        # ── Step 1: Collect all listing links ──────────────────────
         browser, page = await make_browser_page(p)
         print("WARMING SESSION...")
         await page.goto("https://www.olx.uz/", wait_until="domcontentloaded")
@@ -548,13 +564,13 @@ async def main():
         print(f"\nTOTAL UNIQUE LINKS: {len(all_links)}")
         await browser.close()
 
-        # ── Step 2: scrape each ad, restarting browser every N listings ──
+        # ── Step 2: Scrape each ad ──────────────────────────────────
         browser, page = await make_browser_page(p)
 
         for idx, link in enumerate(all_links, start=1):
             ad_counter += 1
 
-            # Restart browser every BROWSER_RESTART_EVERY listings to free memory
+            # Restart browser every N listings to free memory
             if idx > 1 and (idx - 1) % BROWSER_RESTART_EVERY == 0:
                 print(f"\n  ── restarting browser at listing {idx} to free memory ──\n")
                 try:
@@ -564,12 +580,16 @@ async def main():
                 await asyncio.sleep(3)
                 browser, page = await make_browser_page(p)
 
-            print(f"[{idx}/{len(all_links)} | Total: {ad_counter}] {link.split('/')[-1]}")
+            print(f"[{idx}/{len(all_links)}] {link.split('/')[-1]}")
             data = await scrape_ad(page, link)
 
             if data:
                 batch_data.append(data)
-                print(f"  ✓ ID={data['listing_id']} | {(data['title'] or '')[:50]}")
+                print(
+                    f"  ✓ ID={data['listing_id']} | "
+                    f"loc={data['location']} | "
+                    f"{(data['title'] or '')[:45]}"
+                )
             else:
                 print("  ✗ skipped")
 
@@ -582,7 +602,7 @@ async def main():
 
             if ad_counter % LONG_BREAK_EVERY == 0:
                 secs = random.uniform(*LONG_BREAK_SECS)
-                print(f"\n  ── pause {secs:.0f}s ──\n")
+                print(f"\n  ── pause {secs:.0f}s (every {LONG_BREAK_EVERY} ads) ──\n")
                 await asyncio.sleep(secs)
 
         try:
@@ -594,8 +614,16 @@ async def main():
     if batch_data:
         save_batch_to_db(batch_data, engine)
 
-    print(f"\n{'='*50}\nSCRAPE COMPLETE. {ad_counter} ads processed.\n{'='*50}")
+    print(f"\n{'='*55}")
+    print(f"  SCRAPE COMPLETE  —  {ad_counter} ads processed  —  {now_str()}")
+    print(f"{'='*55}\n")
 
+    return ad_counter
+
+
+# ─────────────────────────────────────────────────────────────────
+# MANUAL RUN  (python scraper.py)
+# ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run_scrape())
