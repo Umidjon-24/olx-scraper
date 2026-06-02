@@ -18,10 +18,10 @@ def job():
 
 
 # ── Schedule: every day at 02:00 Tashkent time ─────────────────
-# Railway containers run UTC. Tashkent is UTC+5, so 02:00 = 21:00 UTC previous day.
-schedule.every().day.at("21:00").do(job)   # 21:00 UTC = 02:00 Tashkent
+# Railway containers run UTC. Tashkent is UTC+5, so 05:15 = 10:15 UTC previous day.
+schedule.every().day.at("05:15").do(job)   # 05:15 UTC = 10:15 Tashkent
 
-print("[SCHEDULER] Scheduler started. Waiting for next run at 21:00 UTC (02:00 Tashkent)...")
+print("[SCHEDULER] Scheduler started. Waiting for next run at 05:15 UTC (10:15 Tashkent)...")
 print(f"[SCHEDULER] Current time: {datetime.now()}")
 
 while True:
