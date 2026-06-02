@@ -24,8 +24,14 @@ BATCH_SIZE = 15  # Save to database every 15 ads
 
 # Railway automatically injects DATABASE_URL when you link a Postgres service.
 # Go to your service → Variables tab and confirm DATABASE_URL is present.
-DATABASE_URL = os.environ.get("DATABASE_URL")
-TABLE_NAME   = "listings"
+DB_USER = os.environ.get("DB_USER", "postgres.kaowfkjtwxeywtikpopw")
+DB_PASS = os.environ.get("DB_PASS")
+DB_HOST = "aws-1-ap-northeast-1.pooler.supabase.com"
+DB_PORT = "5432"
+DB_NAME = "postgres"
+
+DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+TABLE_NAME   = "railway_listing"
 
 
 # ─────────────────────────────────────────────────────────────────
