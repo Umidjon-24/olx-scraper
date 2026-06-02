@@ -30,7 +30,7 @@ DB_PASS = os.environ.get("DB_PASS")          # REQUIRED — set in Railway
 DB_HOST = "aws-1-ap-northeast-1.pooler.supabase.com"
 DB_PORT = "5432"
 DB_NAME = "postgres"
-TABLE_NAME = "olx_listings"
+TABLE_NAME = "railway_listing"
 
 
 # ─────────────────────────────────────────────────────────────────
