@@ -187,8 +187,8 @@ async def get_all_links(page, base_url: str, max_pages: int) -> list[str]:
         # Retry up to 3 times on 403
         for attempt in range(3):
             # ✅ networkidle — critical for lazy-loaded ad cards (same as working Colab)
-            await page.goto(url, wait_until="networkidle", timeout=60000)
-            await page.wait_for_timeout(random.randint(3000, 5000))
+            await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+            await page.wait_for_timeout(random.randint(5000, 7000))
             await human_scroll(page)
 
             page_title = (await page.title()).lower()
