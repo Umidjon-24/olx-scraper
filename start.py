@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
-"""
-Start-up helper:
-Launches the scraper as a background process.
-"""
-import subprocess
-import sys
+import asyncio
+from app.scraper import run_scrape
 
 if __name__ == "__main__":
-    subprocess.run([sys.executable, "-u", "-m", "app.scraper"])
-
-
+    asyncio.run(run_scrape())
