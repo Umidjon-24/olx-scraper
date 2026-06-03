@@ -18,7 +18,7 @@ from sqlalchemy import create_engine
 # ─────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────
-BASE_URL   = "https://www.olx.uz/nedvizhimost/kvartiry/prodazha/?currency=UZS"
+BASE_URL   = "https://www.olx.uz/nedvizhimost/kvartiry/prodazha/?currency=UZS&search%5Border%5D=created_at:desc"
 MAX_PAGES  = 25
 BATCH_SIZE = 15  # Save to database every 15 ads
 
