@@ -197,7 +197,7 @@ async def get_all_links(page, base_url: str, max_pages: int) -> list[str]:
         for attempt in range(3):
             # networkidle is correct here — we need the ad cards to lazy-load
             await page.goto(url, wait_until="networkidle", timeout=90000)
-            await page.wait_for_timeout(random.randint(5000, 7000))
+            await page.wait_for_timeout(random.randint(7000, 9000))
             await human_scroll(page)
 
             page_title = (await page.title()).lower()
