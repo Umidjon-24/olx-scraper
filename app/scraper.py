@@ -1,15 +1,9 @@
 """
 OLX scraper — Railway production version.
-Merged from working Colab version with all improvements.
-Uses Playwright (async) to scrape apartment listings from olx.uz.
-
-FIXES in this version:
-- Views: listener attached before goto, switched ad pages to domcontentloaded
-  so the statistics XHR is not missed before networkidle fires.
-- Views: broader URL pattern match (covers /statistic/ and /statistics/)
-- Views: debug logging for the stats endpoint (disable after confirming it works)
-- Views: longer post-scroll wait (2.5s) to give the XHR time to complete
-- Views: raw response logged on first hit so you can verify the JSON path
+Views fix: uses DOM element [data-testid="page-view-counter"] from the
+working Colab version instead of XHR interception.
+Ad pages use domcontentloaded (faster, no missed events).
+List pages keep networkidle + 90s timeout for lazy-loaded cards.
 """
 
 import asyncio
@@ -28,34 +22,29 @@ from sqlalchemy import create_engine
 # ─────────────────────────────────────────────────────────────────
 BASE_URL   = "https://www.olx.uz/nedvizhimost/kvartiry/prodazha/?currency=UZS&search%5Border%5D=created_at:desc"
 MAX_PAGES  = 25
-BATCH_SIZE = 15  # Save to database every 15 ads
+BATCH_SIZE = 15
 
-# ── Supabase connection pooler ────────────────────────────────────
 DB_USER = os.environ.get("DB_USER", "postgres.kaowfkjtwxeywtikpopw")
-DB_PASS = os.environ.get("DB_PASS")          # REQUIRED — set in Railway
+DB_PASS = os.environ.get("DB_PASS")
 DB_HOST = "aws-1-ap-northeast-1.pooler.supabase.com"
 DB_PORT = "5432"
 DB_NAME = "postgres"
 TABLE_NAME = "railway_listing"
 
-# Set to True temporarily to log the stats API URL + raw JSON.
-# Flip back to False once you've confirmed views are being captured.
-DEBUG_VIEWS = True
-
 
 # ─────────────────────────────────────────────────────────────────
 # TIMING PROFILES
 # ─────────────────────────────────────────────────────────────────
-AD_WAIT_MS       = (1800, 3500)   # wait after loading each ad page
-BETWEEN_ADS      = (2.0, 4.0)    # pause between individual ads
-BETWEEN_LIST     = (4.0, 8.0)    # pause between listing pages
-LONG_BREAK_EVERY = 15             # take a long break every N ads
-LONG_BREAK_SECS  = (10, 15)      # duration of that long break
+AD_WAIT_MS       = (1800, 3500)
+BETWEEN_ADS      = (2.0, 4.0)
+BETWEEN_LIST     = (4.0, 8.0)
+LONG_BREAK_EVERY = 15
+LONG_BREAK_SECS  = (10, 15)
 SCROLL_PASSES    = (2, 3)
 SCROLL_DIST_PX   = (500, 1200)
 SCROLL_PAUSE     = (0.4, 0.9)
 
-BROWSER_RESTART_EVERY = 50        # restart browser every N listings to free memory
+BROWSER_RESTART_EVERY = 50
 
 CHROMIUM_ARGS = [
     "--no-sandbox",
@@ -121,7 +110,6 @@ async def human_scroll(page, fast: bool = False) -> None:
 # ─────────────────────────────────────────────────────────────────
 
 def get_engine():
-    """Build SQLAlchemy engine from Supabase pooler credentials."""
     if not DB_PASS:
         raise RuntimeError(
             "DB_PASS environment variable is not set. "
@@ -132,7 +120,6 @@ def get_engine():
 
 
 def save_batch_to_db(data_list: list[dict], engine) -> None:
-    """Appends a batch of listings to Supabase Postgres (no deduplication by design)."""
     if not data_list:
         return
     df = pd.DataFrame(data_list)
@@ -154,7 +141,6 @@ def save_batch_to_db(data_list: list[dict], engine) -> None:
 # ─────────────────────────────────────────────────────────────────
 
 async def make_browser_page(p):
-    """Launch a fresh browser + context + page."""
     browser = await p.chromium.launch(headless=True, slow_mo=80, args=CHROMIUM_ARGS)
     context = await browser.new_context(
         viewport={"width": 1400, "height": 900},
@@ -167,8 +153,6 @@ async def make_browser_page(p):
         ),
     )
     page = await context.new_page()
-
-    # Anti-detection
     await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         window.chrome = { runtime: {} };
@@ -195,9 +179,16 @@ async def get_all_links(page, base_url: str, max_pages: int) -> list[str]:
         print(f"── LIST PAGE {pg}/{max_pages}: {url}")
 
         for attempt in range(3):
-            # networkidle is correct here — we need the ad cards to lazy-load
-            await page.goto(url, wait_until="networkidle", timeout=90000)
-            await page.wait_for_timeout(random.randint(7000, 9000))
+            try:
+                # networkidle needed for lazy-loaded ad cards — keep 90s timeout
+                await page.goto(url, wait_until="networkidle", timeout=90000)
+            except Exception as e:
+                wait_secs = (attempt + 1) * 15
+                print(f"   ✗ goto failed: {e} — waiting {wait_secs}s, retry {attempt+1}/3")
+                await asyncio.sleep(wait_secs)
+                continue
+
+            await page.wait_for_timeout(random.randint(2000, 4000))
             await human_scroll(page)
 
             page_title = (await page.title()).lower()
@@ -205,7 +196,7 @@ async def get_all_links(page, base_url: str, max_pages: int) -> list[str]:
 
             if "403" in page_title or "access denied" in body_text or "captcha" in body_text:
                 wait_secs = (attempt + 1) * 15
-                print(f"   ✗ 403 ERROR — waiting {wait_secs}s before retry {attempt+1}/3")
+                print(f"   ✗ 403/captcha — waiting {wait_secs}s, retry {attempt+1}/3")
                 await asyncio.sleep(wait_secs)
                 continue
 
@@ -256,109 +247,19 @@ async def get_list_container_attrs(page) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────
-# VIEWS RESPONSE HANDLER
-# ─────────────────────────────────────────────────────────────────
-
-def make_views_handler(views_holder: dict, debug: bool = False):
-    """
-    Returns an async response handler that captures the view count from
-    OLX's statistics XHR.
-
-    The handler uses a broad URL match ('statistic') to survive endpoint
-    path changes, then safely walks the JSON tree. With debug=True it
-    logs every 200 response URL so you can identify the exact endpoint
-    if views are still missing.
-    """
-    _logged_raw = {"done": False}  # log raw JSON only once per ad
-
-    async def handle_response(response):
-        try:
-            if response.status != 200:
-                return
-
-            url_lower = response.url.lower()
-
-            # Log ALL 200s when debugging — helps find the real endpoint
-            if debug:
-                print(f"  [NET 200] {response.url[:100]}")
-
-            # Broad match: covers /statistic/, /statistics/, etc.
-            if "statistic" not in url_lower:
-                return
-
-            data = await response.json()
-
-            # Log raw JSON once so you can verify the path is correct
-            if debug and not _logged_raw["done"]:
-                print(f"  [STATS RAW] {response.url}")
-                print(f"  [STATS RAW] {str(data)[:300]}")
-                _logged_raw["done"] = True
-
-            # Primary path (observed in the wild)
-            v = (
-                data.get("data", {})
-                    .get("statistics", {})
-                    .get("page_views", {})
-                    .get("sum")
-            )
-
-            # Fallback paths — add more here if the raw log shows a
-            # different structure
-            if v is None:
-                v = data.get("page_views", {}).get("sum")
-            if v is None:
-                v = data.get("statistics", {}).get("page_views", {}).get("sum")
-            if v is None:
-                v = data.get("data", {}).get("page_views", {}).get("sum")
-
-            if v is not None:
-                views_holder["value"] = int(v)
-                if debug:
-                    print(f"  [VIEWS] captured: {views_holder['value']}")
-
-        except Exception as e:
-            if debug:
-                print(f"  [STATS ERR] {e}")
-
-    return handle_response
-
-
-# ─────────────────────────────────────────────────────────────────
 # SCRAPE ONE AD
 # ─────────────────────────────────────────────────────────────────
 
 async def scrape_ad(page, url: str) -> dict | None:
     try:
-        # ── Views capture ─────────────────────────────────────────
-        # IMPORTANT: listener must be attached BEFORE goto so we don't
-        # miss the XHR that fires during page load.
-        # We also use domcontentloaded (not networkidle) so the event
-        # loop is free to process the response callbacks as they arrive.
-        views_holder: dict = {"value": None}
-        handler = make_views_handler(views_holder, debug=DEBUG_VIEWS)
-        page.on("response", handler)
-
-        for attempt in range(3):
-        try:
-            await page.goto(url, wait_until="networkidle", timeout=90000)
-        except Exception as e:
-            print(f"   ✗ goto failed ({e}) — retry {attempt+1}/3")
-        await asyncio.sleep(10)
-        continue
-
-        # Wait for the page to settle and stats XHR to fire
+        # domcontentloaded — same as working Colab version, faster than networkidle
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(random.randint(*AD_WAIT_MS))
         await human_scroll(page)
 
-        # Extra pause: the statistics XHR sometimes fires after scroll
-        await asyncio.sleep(2.5)
-
-        page.remove_listener("response", handler)
-        # ─────────────────────────────────────────────────────────
-
         page_title = await page.title()
         if any(x in page_title.lower() for x in ["403", "access denied", "captcha", "just a moment"]):
-            print("  BLOCKED (403) — waiting 20s and skipping")
+            print("  BLOCKED — waiting 20s and skipping")
             await asyncio.sleep(20)
             return None
 
@@ -466,8 +367,14 @@ async def scrape_ad(page, url: str) -> dict | None:
             except Exception:
                 pass
 
-        # 5. Views — captured from OLX statistics API response handler above
-        views = views_holder["value"]
+        # 5. Views — DOM element, same approach as working Colab version
+        views = None
+        try:
+            views_loc = page.locator('[data-testid="page-view-counter"]')
+            if await views_loc.count() > 0:
+                views = extract_number(await views_loc.first.inner_text())
+        except Exception:
+            pass
 
         # 6. Posted date
         posted_date = None
@@ -602,20 +509,14 @@ async def scrape_ad(page, url: str) -> dict | None:
 
 
 # ─────────────────────────────────────────────────────────────────
-# MAIN SCRAPE FUNCTION  (called by scheduler.py or directly)
+# MAIN SCRAPE FUNCTION
 # ─────────────────────────────────────────────────────────────────
 
 async def run_scrape():
-    """
-    Main entry point for a full scrape run.
-    Called by scheduler.py for daily cron, or by __main__ for manual runs.
-    Returns total number of listings saved.
-    """
     print(f"\n{'='*55}")
     print(f"  SCRAPE STARTED  —  {now_str()}")
     print(f"{'='*55}\n")
 
-    # Initialize DB engine
     try:
         engine = get_engine()
         print("✓ Database engine initialized (Supabase pooler).")
@@ -638,6 +539,7 @@ async def run_scrape():
         all_links = await get_all_links(page, BASE_URL, MAX_PAGES)
         all_links = list(set(all_links))
         print(f"\nTOTAL UNIQUE LINKS: {len(all_links)}")
+        print("Starting ad scrape...\n")
         await browser.close()
 
         # ── Step 2: Scrape each ad ──────────────────────────────────
@@ -670,7 +572,6 @@ async def run_scrape():
             else:
                 print("  ✗ skipped")
 
-            # Flush batch to DB every BATCH_SIZE listings
             if len(batch_data) >= BATCH_SIZE:
                 save_batch_to_db(batch_data, engine)
                 batch_data.clear()
@@ -687,7 +588,6 @@ async def run_scrape():
         except Exception:
             pass
 
-    # Final flush for any remaining items
     if batch_data:
         save_batch_to_db(batch_data, engine)
 
@@ -699,7 +599,7 @@ async def run_scrape():
 
 
 # ─────────────────────────────────────────────────────────────────
-# MANUAL RUN  (python scraper.py)
+# MANUAL RUN
 # ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
