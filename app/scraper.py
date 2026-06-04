@@ -338,7 +338,13 @@ async def scrape_ad(page, url: str) -> dict | None:
         handler = make_views_handler(views_holder, debug=DEBUG_VIEWS)
         page.on("response", handler)
 
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        for attempt in range(3):
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=90000)
+        except Exception as e:
+            print(f"   ✗ goto failed ({e}) — retry {attempt+1}/3")
+        await asyncio.sleep(10)
+        continue
 
         # Wait for the page to settle and stats XHR to fire
         await page.wait_for_timeout(random.randint(*AD_WAIT_MS))
