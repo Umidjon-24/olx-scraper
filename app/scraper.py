@@ -1,9 +1,8 @@
 """
 OLX scraper — Railway production version.
-Views fix: uses DOM element [data-testid="page-view-counter"] from the
-working Colab version instead of XHR interception.
-Ad pages use domcontentloaded (faster, no missed events).
-List pages keep networkidle + 90s timeout for lazy-loaded cards.
+Views: captured from GraphQL endpoint:
+  https://production-graphql.eu-sharedservices.olxcdn.com/graphql
+  JSON path: data.myAds.pageViews.pageViews
 """
 
 import asyncio
@@ -180,7 +179,6 @@ async def get_all_links(page, base_url: str, max_pages: int) -> list[str]:
 
         for attempt in range(3):
             try:
-                # networkidle needed for lazy-loaded ad cards — keep 90s timeout
                 await page.goto(url, wait_until="networkidle", timeout=90000)
             except Exception as e:
                 wait_secs = (attempt + 1) * 15
@@ -247,15 +245,55 @@ async def get_list_container_attrs(page) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────
+# VIEWS HANDLER  — GraphQL endpoint
+# ─────────────────────────────────────────────────────────────────
+
+def make_views_handler(views_holder: dict):
+    """
+    Captures views from the GraphQL endpoint that fires on every ad page:
+      https://production-graphql.eu-sharedservices.olxcdn.com/graphql
+      JSON path: data.myAds.pageViews.pageViews
+    Listener must be attached BEFORE page.goto().
+    """
+    async def handle_response(response):
+        try:
+            if "production-graphql" not in response.url:
+                return
+            if response.status != 200:
+                return
+            data = await response.json()
+            v = (
+                data.get("data", {})
+                    .get("myAds", {})
+                    .get("pageViews", {})
+                    .get("pageViews")
+            )
+            if v is not None:
+                views_holder["value"] = int(v)
+        except Exception:
+            pass
+
+    return handle_response
+
+
+# ─────────────────────────────────────────────────────────────────
 # SCRAPE ONE AD
 # ─────────────────────────────────────────────────────────────────
 
 async def scrape_ad(page, url: str) -> dict | None:
     try:
-        # domcontentloaded — same as working Colab version, faster than networkidle
+        # Attach views listener BEFORE goto so we don't miss the GraphQL call
+        views_holder: dict = {"value": None}
+        handler = make_views_handler(views_holder)
+        page.on("response", handler)
+
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(random.randint(*AD_WAIT_MS))
         await human_scroll(page)
+        # GraphQL call fires shortly after DOM load; give it a moment
+        await asyncio.sleep(2.0)
+
+        page.remove_listener("response", handler)
 
         page_title = await page.title()
         if any(x in page_title.lower() for x in ["403", "access denied", "captcha", "just a moment"]):
@@ -367,14 +405,8 @@ async def scrape_ad(page, url: str) -> dict | None:
             except Exception:
                 pass
 
-        # 5. Views — DOM element, same approach as working Colab version
-        views = None
-        try:
-            views_loc = page.locator('[data-testid="page-view-counter"]')
-            if await views_loc.count() > 0:
-                views = extract_number(await views_loc.first.inner_text())
-        except Exception:
-            pass
+        # 5. Views — from GraphQL response captured above
+        views = views_holder["value"]
 
         # 6. Posted date
         posted_date = None
@@ -548,7 +580,6 @@ async def run_scrape():
         for idx, link in enumerate(all_links, start=1):
             ad_counter += 1
 
-            # Restart browser every N listings to free memory
             if idx > 1 and (idx - 1) % BROWSER_RESTART_EVERY == 0:
                 print(f"\n  ── restarting browser at listing {idx} to free memory ──\n")
                 try:
