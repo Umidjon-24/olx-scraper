@@ -2,6 +2,14 @@
 OLX scraper — Railway production version.
 Merged from working Colab version with all improvements.
 Uses Playwright (async) to scrape apartment listings from olx.uz.
+
+FIXES in this version:
+- Views: listener attached before goto, switched ad pages to domcontentloaded
+  so the statistics XHR is not missed before networkidle fires.
+- Views: broader URL pattern match (covers /statistic/ and /statistics/)
+- Views: debug logging for the stats endpoint (disable after confirming it works)
+- Views: longer post-scroll wait (2.5s) to give the XHR time to complete
+- Views: raw response logged on first hit so you can verify the JSON path
 """
 
 import asyncio
@@ -23,8 +31,6 @@ MAX_PAGES  = 25
 BATCH_SIZE = 15  # Save to database every 15 ads
 
 # ── Supabase connection pooler ────────────────────────────────────
-# Set these as environment variables in Railway → Variables tab.
-# Never hardcode credentials in source code.
 DB_USER = os.environ.get("DB_USER", "postgres.kaowfkjtwxeywtikpopw")
 DB_PASS = os.environ.get("DB_PASS")          # REQUIRED — set in Railway
 DB_HOST = "aws-1-ap-northeast-1.pooler.supabase.com"
@@ -32,9 +38,13 @@ DB_PORT = "5432"
 DB_NAME = "postgres"
 TABLE_NAME = "railway_listing"
 
+# Set to True temporarily to log the stats API URL + raw JSON.
+# Flip back to False once you've confirmed views are being captured.
+DEBUG_VIEWS = True
+
 
 # ─────────────────────────────────────────────────────────────────
-# TIMING PROFILES  ← restored to working Colab values
+# TIMING PROFILES
 # ─────────────────────────────────────────────────────────────────
 AD_WAIT_MS       = (1800, 3500)   # wait after loading each ad page
 BETWEEN_ADS      = (2.0, 4.0)    # pause between individual ads
@@ -158,7 +168,7 @@ async def make_browser_page(p):
     )
     page = await context.new_page()
 
-    # Anti-detection — matches Colab working version
+    # Anti-detection
     await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         window.chrome = { runtime: {} };
@@ -184,9 +194,8 @@ async def get_all_links(page, base_url: str, max_pages: int) -> list[str]:
         url = page_url(base_url, pg)
         print(f"── LIST PAGE {pg}/{max_pages}: {url}")
 
-        # Retry up to 3 times on 403
         for attempt in range(3):
-            # ✅ networkidle — critical for lazy-loaded ad cards (same as working Colab)
+            # networkidle is correct here — we need the ad cards to lazy-load
             await page.goto(url, wait_until="networkidle", timeout=90000)
             await page.wait_for_timeout(random.randint(5000, 7000))
             await human_scroll(page)
@@ -247,38 +256,99 @@ async def get_list_container_attrs(page) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────
+# VIEWS RESPONSE HANDLER
+# ─────────────────────────────────────────────────────────────────
+
+def make_views_handler(views_holder: dict, debug: bool = False):
+    """
+    Returns an async response handler that captures the view count from
+    OLX's statistics XHR.
+
+    The handler uses a broad URL match ('statistic') to survive endpoint
+    path changes, then safely walks the JSON tree. With debug=True it
+    logs every 200 response URL so you can identify the exact endpoint
+    if views are still missing.
+    """
+    _logged_raw = {"done": False}  # log raw JSON only once per ad
+
+    async def handle_response(response):
+        try:
+            if response.status != 200:
+                return
+
+            url_lower = response.url.lower()
+
+            # Log ALL 200s when debugging — helps find the real endpoint
+            if debug:
+                print(f"  [NET 200] {response.url[:100]}")
+
+            # Broad match: covers /statistic/, /statistics/, etc.
+            if "statistic" not in url_lower:
+                return
+
+            data = await response.json()
+
+            # Log raw JSON once so you can verify the path is correct
+            if debug and not _logged_raw["done"]:
+                print(f"  [STATS RAW] {response.url}")
+                print(f"  [STATS RAW] {str(data)[:300]}")
+                _logged_raw["done"] = True
+
+            # Primary path (observed in the wild)
+            v = (
+                data.get("data", {})
+                    .get("statistics", {})
+                    .get("page_views", {})
+                    .get("sum")
+            )
+
+            # Fallback paths — add more here if the raw log shows a
+            # different structure
+            if v is None:
+                v = data.get("page_views", {}).get("sum")
+            if v is None:
+                v = data.get("statistics", {}).get("page_views", {}).get("sum")
+            if v is None:
+                v = data.get("data", {}).get("page_views", {}).get("sum")
+
+            if v is not None:
+                views_holder["value"] = int(v)
+                if debug:
+                    print(f"  [VIEWS] captured: {views_holder['value']}")
+
+        except Exception as e:
+            if debug:
+                print(f"  [STATS ERR] {e}")
+
+    return handle_response
+
+
+# ─────────────────────────────────────────────────────────────────
 # SCRAPE ONE AD
 # ─────────────────────────────────────────────────────────────────
 
 async def scrape_ad(page, url: str) -> dict | None:
     try:
-        # Intercept OLX statistics API to capture view count
+        # ── Views capture ─────────────────────────────────────────
+        # IMPORTANT: listener must be attached BEFORE goto so we don't
+        # miss the XHR that fires during page load.
+        # We also use domcontentloaded (not networkidle) so the event
+        # loop is free to process the response callbacks as they arrive.
         views_holder: dict = {"value": None}
+        handler = make_views_handler(views_holder, debug=DEBUG_VIEWS)
+        page.on("response", handler)
 
-        async def handle_response(response):
-            try:
-                if "statistics" in response.url and response.status == 200:
-                    data = await response.json()
-                    v = (
-                        data.get("data", {})
-                            .get("statistics", {})
-                            .get("page_views", {})
-                            .get("sum")
-                    )
-                    if v is not None:
-                        views_holder["value"] = int(v)
-            except Exception:
-                pass
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-        page.on("response", handle_response)
-
-        await page.goto(url, wait_until="networkidle", timeout=60000)
+        # Wait for the page to settle and stats XHR to fire
         await page.wait_for_timeout(random.randint(*AD_WAIT_MS))
         await human_scroll(page)
 
-        # Give the stats API a moment to respond
-        await asyncio.sleep(1.5)
-        page.remove_listener("response", handle_response)
+        # Extra pause: the statistics XHR sometimes fires after scroll
+        await asyncio.sleep(2.5)
+
+        page.remove_listener("response", handler)
+        # ─────────────────────────────────────────────────────────
 
         page_title = await page.title()
         if any(x in page_title.lower() for x in ["403", "access denied", "captcha", "just a moment"]):
@@ -390,7 +460,7 @@ async def scrape_ad(page, url: str) -> dict | None:
             except Exception:
                 pass
 
-        # 5. Views — captured from OLX statistics API response
+        # 5. Views — captured from OLX statistics API response handler above
         views = views_holder["value"]
 
         # 6. Posted date
@@ -587,6 +657,7 @@ async def run_scrape():
                 batch_data.append(data)
                 print(
                     f"  ✓ ID={data['listing_id']} | "
+                    f"views={data['views']} | "
                     f"loc={data['location']} | "
                     f"{(data['title'] or '')[:45]}"
                 )
