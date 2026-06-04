@@ -272,7 +272,7 @@ async def scrape_ad(page, url: str) -> dict | None:
 
         page.on("response", handle_response)
 
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await page.goto(url, wait_until="networkidle", timeout=60000)
         await page.wait_for_timeout(random.randint(*AD_WAIT_MS))
         await human_scroll(page)
 
