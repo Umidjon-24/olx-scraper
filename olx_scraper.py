@@ -4,37 +4,25 @@ Scrapes apartment listings from olx.uz and upserts into Supabase.
 
 Data sources, in priority order:
   1. <script type="application/ld+json">  — server-rendered, reliable title/price/currency/description.
-  2. The on-page parameter list (Общая площадь, Этаж, …) parsed element-by-element
-     so values never bleed across parameters.
+  2. The on-page parameter list (Общая площадь, Этаж, …) parsed element-by-element.
   3. DOM selectors / description inference as a last resort.
 
-Tuned for completeness, not speed — we have plenty of memory, so we load fully,
-wait for render, and retry hard. Redirected/removed listings are skipped, never
-saved as empty rows.
-
 ────────────────────────────────────────────────────────────────────────────
-CHANGES vs the previous version (memory + speed):
-  • flush_page(): navigate to about:blank between ads so Chromium's renderer
-    can GC the previous SPA heap WITHOUT a full browser restart. This is the
-    single biggest RAM win.
-  • kill_orphan_chrome(): on every browser restart we sweep leftover Chromium
-    OS processes (browser.close() is graceful and sometimes fails to reap them
-    → the classic Railway OOM). Requires `psutil`; degrades gracefully if absent.
-  • Extended request blocking: also abort map tiles / analytics / ad-network
-    requests by host, not just image/media/font by type. Location comes from the
-    server-rendered breadcrumb, so the map widget is never needed.
-  • wait_for_param(): replaced the blind 3.5–6s AD_WAIT sleep with a wait on the
-    ACTUAL parameter text ('Общая площадь'). Returns in ~1–2s on a healthy
-    render instead of always paying the full timer; still falls through to the
-    retry logic for genuine empty shells.
-  • get_location(): breadcrumb is read FIRST (it's in the DOM at load). The
-    expensive full-page scroll only runs as a fallback when the breadcrumb is
-    empty — so most ads skip it entirely.
-  • slow_mo 60→20, fewer scroll passes, smaller AD_WAIT_MS. None of these are
-    observed by OLX's antibot (which keys on request cadence, not page dwell).
-  • BETWEEN_ADS trimmed modestly. This is the ONE knob the server actually sees
-    (it spaces real navigations). If 403s rise, raise it back first — it's the
-    only change here that trades block-safety for speed.
+CHANGES in this version:
+  • RESTORED the CONFIG block (BASE_URL, MAX_PAGES, DB_*, TABLE_NAME). All still
+    read from env vars exactly as before — defaults shown below.
+  • SINGLE-TRIGGER SCHEDULER at the bottom (see ENTRYPOINT). Honors RUN_ON_START
+    and SCRAPE_HOUR, but the boot run is awaited in the SAME event loop as the
+    cron, so the in-process _scrape_lock actually protects against overlap.
+    APScheduler's max_instances=1 is a second backstop.
+  • Postgres ADVISORY LOCK (try_acquire_run_lock): a cross-process/replica mutex.
+    A second run — from a deploy handoff, a stray replica, or anything the
+    in-process lock can't see — bails immediately without touching the first.
+  • Memory/speed fixes retained: flush_page() between ads, kill_orphan_chrome()
+    on restart, extended request blocking, wait_for_param() instead of a blind
+    sleep, breadcrumb-first location, lower slow_mo / fewer scroll passes.
+  • ensure_table migrates ANY pre-existing table to the full schema before
+    referencing columns (fixes 'column scraped_date does not exist').
 ────────────────────────────────────────────────────────────────────────────
 """
 
@@ -61,25 +49,30 @@ except Exception:
     _HAVE_PSUTIL = False
 
 
+# ─────────────────────────────────────────────────────────────────
+# CONFIG  — all read from environment variables (set these in Railway).
+# ─────────────────────────────────────────────────────────────────
+BASE_URL   = os.getenv("OLX_BASE_URL", "https://www.olx.uz/nedvizhimost/kvartiry/prodazha/?currency=UZS")
+MAX_PAGES  = int(os.getenv("MAX_PAGES", "25"))
+
+DB_USER    = os.environ.get("DB_USER")
+DB_PASS    = os.environ.get("DB_PASS")
+DB_HOST    = os.environ.get("DB_HOST", "aws-0-ap-southeast-1.pooler.supabase.com")
+DB_PORT    = os.environ.get("DB_PORT", "5432")
+DB_NAME    = os.environ.get("DB_NAME", "postgres")
+TABLE_NAME = os.getenv("TABLE_NAME", "olx_listings")
+
 # How many of the first ads to dump full diagnostics for (set DIAG_DUMP>0 to enable).
 DIAG_DUMP  = int(os.getenv("DIAG_DUMP", "0"))
 
-# Resume: within a run, skip listings that already have TODAY's snapshot row, so a
-# restarted/overlapping run finishes today's snapshot instead of starting over.
-# Each new calendar day re-scrapes everything (a fresh daily snapshot).
+# Resume: within a run, skip listings that already have TODAY's snapshot row.
 RESUME_SKIP_DONE_TODAY = os.getenv("RESUME_SKIP_DONE_TODAY", "true").lower() == "true"
 
-# Hard wall-clock budget for a single run. We stop cleanly when reached so a slow
-# run can never bleed past the next daily cron (which APScheduler would then skip
-# with "maximum number of running instances reached"). The next run resumes.
+# Hard wall-clock budget for a single run.
 MAX_RUNTIME_HOURS = float(os.getenv("MAX_RUNTIME_HOURS", "22"))
 
 # ─────────────────────────────────────────────────────────────────
-# TIMING  — balanced for completeness without tripping OLX blocks.
-#
-# Most of these are page-dwell knobs the server NEVER sees, so they were
-# trimmed for speed with no added block risk. The only knob OLX actually
-# observes is BETWEEN_ADS (it spaces real navigations) — trim THAT last.
+# TIMING
 # ─────────────────────────────────────────────────────────────────
 AD_WAIT_MS            = (1200, 2500)  # small buffer; real readiness is wait_for_param()
 PARAM_WAIT_MS         = 8000          # max wait for the parameter text to render
@@ -87,30 +80,25 @@ BETWEEN_ADS           = (2.0, 4.0)    # ← the real rate limiter; raise this fi
 BETWEEN_LIST          = (4.5, 9.0)
 LONG_BREAK_EVERY      = 22
 LONG_BREAK_SECS       = (13, 22)
-SCROLL_PASSES         = (1, 2)        # was (2, 3) — one pass is enough to trigger lazy mount
+SCROLL_PASSES         = (1, 2)
 SCROLL_DIST_PX        = (500, 1200)
 SCROLL_PAUSE          = (0.3, 0.6)
-# Tear Chromium down periodically — its memory grows across navigations. With the
-# new about:blank flush between ads this can stay relatively high; the flush does
-# the per-ad reclaiming, this catches slow long-term creep.
 BROWSER_RESTART_EVERY = int(os.getenv("BROWSER_RESTART_EVERY", "15"))
 AD_ATTEMPTS           = int(os.getenv("AD_ATTEMPTS", "4"))
 BATCH_SIZE            = 1             # save every listing immediately
 
+# Unique key for the Postgres advisory lock (any constant 32-bit int works).
+RUN_LOCK_KEY = int(os.getenv("RUN_LOCK_KEY", "916273"))
+
 CHROMIUM_ARGS = [
-    # Required for headless on Linux/Railway
     "--no-sandbox",
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
-    # Cap on-disk / media caches to curb memory growth. These do NOT touch the V8
-    # heap, so React still renders fully (unlike --js-flags=--max-old-space-size).
     "--disk-cache-size=1",
     "--media-cache-size=1",
     "--disable-application-cache",
-    # GPU not needed in headless
     "--disable-gpu",
     "--disable-accelerated-2d-canvas",
-    # Misc hardening / noise reduction
     "--disable-web-security",
     "--disable-extensions",
     "--disable-background-networking",
@@ -157,7 +145,7 @@ def listing_id_from_url(url):
 
 
 def normalize_area(val):
-    """Normalize an area value to '<number> м²' (handles '76', '76 м²', '50,43 m²')."""
+    """Normalize an area value to '<number> м²'."""
     if not val:
         return None
     m = re.search(r"(\d+[.,]?\d*)", str(val))
@@ -167,45 +155,30 @@ def normalize_area(val):
 
 
 def clean_location(raw):
-    """Turn the raw map-block text into a clean 'City, District' (drops widget junk).
-
-    Raw looks like: 'Ташкент, Яшнабадский район Ташкентская область Изображений
-    нет. Картографические данные Условия Посмотреть расположение на карте'
-    → 'Ташкент, Яшнабадский район'
-    """
+    """Turn the raw map-block text into a clean 'City, District' (drops widget junk)."""
     if not raw:
         return None
     t = clean(raw)
     if not t:
         return None
-    # Cut everything from the map-widget boilerplate onward.
     t = re.split(
         r"\s*(?:Изображени|Картограф|Посмотрет|Услови|Show|Map data|Terms|©|http)",
         t, maxsplit=1, flags=re.I,
     )[0]
-    # Strip category prefixes that leak in from breadcrumb items.
     t = re.sub(r"\b(Продажа|Аренда|Sotuv|Ijara)\s*[-–]\s*", "", t, flags=re.I)
     t = clean(t)
     if not t:
         return None
-    # If a district is present, keep through it and drop the region tail.
     m = re.search(r"^(.*?\bрайон)\b", t, flags=re.I)
     if m:
         return clean(m.group(1))
-    # No district: keep city + region but cap length to avoid stray text.
     return clean(t[:60])
 
 
 def location_from_title(page_title):
-    """OLX titles end with '… - Продажа <City> на Olx' — pull the city out.
-
-    Anchored to the trailing 'Продажа … на Olx' suffix (noun form, end of string)
-    so a listing title that itself starts with 'Продаётся …' isn't mistaken for it.
-    """
+    """OLX titles end with '… - Продажа <City> на Olx' — pull the city out."""
     if not page_title:
         return None
-    # Greedy prefix locks onto the LAST 'Продажа … на Olx' (the suffix), so a
-    # listing title that itself starts with 'Продажа …' isn't captured by mistake.
     m = re.search(r".*Продажа\s+(.+?)\s+на\s+Olx\s*$", page_title, re.I)
     return clean(m.group(1)) if m else None
 
@@ -225,11 +198,7 @@ async def human_scroll(page, fast=False):
 
 
 async def flush_page(page):
-    """Navigate to about:blank so the renderer can GC the previous SPA heap.
-
-    Cheaper than a full browser restart — call between ads to stop per-navigation
-    memory creep without paying Chromium teardown/startup cost every time.
-    """
+    """Navigate to about:blank so the renderer can GC the previous SPA heap."""
     try:
         await page.goto("about:blank", wait_until="domcontentloaded", timeout=5000)
     except Exception:
@@ -237,14 +206,7 @@ async def flush_page(page):
 
 
 def kill_orphan_chrome():
-    """SIGKILL leftover Chromium processes.
-
-    browser.close() is graceful and occasionally fails to reap the OS process,
-    so dead Chromium instances accumulate across restarts and the container gets
-    OOM-killed. This is safe ONLY in the gap between closing one browser and
-    creating the next — which is the only place we call it — because no browser
-    of ours is alive at that moment.
-    """
+    """SIGKILL leftover Chromium processes. Safe only between browsers."""
     if not _HAVE_PSUTIL:
         return
     killed = 0
@@ -261,19 +223,15 @@ def kill_orphan_chrome():
 
 
 # ─────────────────────────────────────────────────────────────────
-# DATABASE  — upsert on listing_id
+# DATABASE
 # ─────────────────────────────────────────────────────────────────
 
-# The columns we store, in order. first_seen / last_seen intentionally removed.
-# snapshot_date is part of the PK: one row per listing per day (daily snapshots).
 COLUMNS = [
     "listing_id", "snapshot_date", "olx_id", "title", "price", "currency", "area",
     "num_rooms", "market_type", "views", "stair", "total_floors", "posted_date",
     "scraped_date", "negotiation", "seller", "location", "seller_joined",
     "description", "url",
 ]
-
-# Columns refreshed on a same-day re-scrape (everything except the composite key).
 UPDATE_COLUMNS = [c for c in COLUMNS if c not in ("listing_id", "snapshot_date")]
 
 
@@ -292,13 +250,41 @@ def get_engine():
     return create_engine(url, pool_pre_ping=True)
 
 
-def ensure_table(engine):
-    """Create the listings table if needed and migrate the schema in place.
+def try_acquire_run_lock(engine):
+    """Cross-process mutex via a Postgres advisory lock.
 
-    Primary key is (listing_id, snapshot_date) so each daily run APPENDS a fresh
-    snapshot per listing — one row per listing per day — rather than overwriting.
-    A same-day re-scrape updates that day's row (idempotent resume).
+    Returns an OPEN connection if we got the lock, None if another run holds it,
+    or the sentinel 'no-lock' if the lock check itself errored (we then proceed
+    unprotected rather than fail the run). Auto-releases if the connection drops.
     """
+    conn = engine.connect()
+    try:
+        got = conn.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": RUN_LOCK_KEY}).scalar()
+    except Exception as e:
+        conn.close()
+        print(f"  [lock] advisory-lock check failed (continuing without it): {e}")
+        return "no-lock"
+    if not got:
+        conn.close()
+        return None
+    return conn
+
+
+def release_run_lock(lock_conn):
+    if lock_conn in (None, "no-lock"):
+        return
+    try:
+        lock_conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": RUN_LOCK_KEY})
+    except Exception:
+        pass
+    try:
+        lock_conn.close()
+    except Exception:
+        pass
+
+
+def ensure_table(engine):
+    """Create the listings table if needed and migrate the schema in place."""
     with engine.begin() as conn:
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
@@ -325,12 +311,20 @@ def ensure_table(engine):
                 PRIMARY KEY (listing_id, snapshot_date)
             )
         """))
-        # Migrate existing tables: add olx_id/total_floors, drop first_seen/last_seen.
-        conn.execute(text(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS olx_id BIGINT"))
-        conn.execute(text(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS total_floors TEXT"))
+        # Bring ANY pre-existing table up to the current schema BEFORE referencing
+        # these columns below.
+        schema_types = {
+            "olx_id": "BIGINT", "title": "TEXT", "price": "NUMERIC", "currency": "TEXT",
+            "area": "TEXT", "num_rooms": "INT", "market_type": "TEXT", "views": "INT",
+            "stair": "TEXT", "total_floors": "TEXT", "posted_date": "TEXT",
+            "scraped_date": "TEXT", "negotiation": "BOOLEAN", "seller": "TEXT",
+            "location": "TEXT", "seller_joined": "TEXT", "description": "TEXT", "url": "TEXT",
+        }
+        for col, col_type in schema_types.items():
+            conn.execute(text(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS {col} {col_type}"))
+
         conn.execute(text(f"ALTER TABLE {TABLE_NAME} DROP COLUMN IF EXISTS first_seen"))
         conn.execute(text(f"ALTER TABLE {TABLE_NAME} DROP COLUMN IF EXISTS last_seen"))
-        # Migrate a legacy single-column PK (listing_id) → (listing_id, snapshot_date).
         conn.execute(text(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS snapshot_date DATE"))
         conn.execute(text(
             f"UPDATE {TABLE_NAME} SET snapshot_date = "
@@ -374,19 +368,16 @@ def load_done_today(engine):
 
 
 def tidy_existing_location(loc):
-    """Re-clean a stored location value (handles old map-junk and 3-part forms)."""
     c = clean_location(loc)
     if not c:
         return None
     parts = [p.strip() for p in c.split(",")]
-    # Drop a leading 'X область' when a city + district follow it.
     if len(parts) >= 3 and "область" in parts[0].lower():
         c = ", ".join(parts[1:])
     return c
 
 
 def backfill_locations(engine):
-    """One-time pass to re-clean existing location values. Gated by env var."""
     if os.getenv("BACKFILL_LOCATIONS", "false").lower() != "true":
         return
     print("  [backfill] cleaning existing location values...")
@@ -408,14 +399,11 @@ def backfill_locations(engine):
 
 
 def save_batch_to_db(data_list, engine):
-    """Upsert a batch — insert new listings, refresh ALL fields on conflict."""
     if not data_list:
         return
-
     df = pd.DataFrame(data_list)
     df = df[[c for c in COLUMNS if c in df.columns]]
     records = df.to_dict(orient="records")
-    # pandas turns None into NaN for numeric columns — restore None explicitly
     for rec in records:
         for k, v in rec.items():
             if isinstance(v, float) and math.isnan(v):
@@ -444,7 +432,6 @@ def save_batch_to_db(data_list, engine):
         except Exception as e:
             failed += 1
             print(f"  [DB] ✗ Failed to save listing {rec.get('listing_id')}: {e}")
-
     print(f"  [DB] ✓ {saved} saved, {failed} failed.")
 
 
@@ -452,23 +439,11 @@ def save_batch_to_db(data_list, engine):
 # BROWSER FACTORY
 # ─────────────────────────────────────────────────────────────────
 
-# Block by resource TYPE — these hold no listing data.
 BLOCKED_RESOURCES = {"image", "media", "font"}
-
-# Block by URL fragment — map tiles, analytics, and ad networks. Location comes
-# from the server-rendered breadcrumb, so we never need the map widget. Aborting
-# these cuts both memory (fewer mounted widgets) and time (fewer requests).
 BLOCKED_URL_FRAGMENTS = (
-    "maps.googleapis.com",
-    "maps.gstatic.com",
-    "google-analytics.com",
-    "googletagmanager.com",
-    "doubleclick.net",
-    "googlesyndication.com",
-    "facebook.net",
-    "hotjar.com",
-    "/tile",
-    "/tiles/",
+    "maps.googleapis.com", "maps.gstatic.com", "google-analytics.com",
+    "googletagmanager.com", "doubleclick.net", "googlesyndication.com",
+    "facebook.net", "hotjar.com", "/tile", "/tiles/",
 )
 
 
@@ -508,13 +483,12 @@ async def make_browser_page(p):
 
 
 async def restart_browser(p, browser):
-    """Close the current browser, reap any orphan Chromium, then build a fresh one."""
     try:
         await browser.close()
     except Exception:
         pass
     await asyncio.sleep(2)
-    kill_orphan_chrome()          # safe: no browser of ours is alive right now
+    kill_orphan_chrome()
     await asyncio.sleep(3)
     return await make_browser_page(p)
 
@@ -529,24 +503,16 @@ def page_url(base, page_num):
 
 
 async def get_all_links(p, base_url, max_pages):
-    """Collect listing URLs across ALL pages until the results run out.
-
-    max_pages is just a safety ceiling; we stop early when pagination ends —
-    detected as consecutive pages that are empty (after retries) or add no new
-    listings. This way we capture every page, however many OLX has.
-    """
     all_links = set()
     browser, page = await make_browser_page(p)
-
-    empty_streak = 0   # consecutive pages with NO listing links at all
-    nogain_streak = 0  # consecutive pages adding 0 new (duplicates/end)
+    empty_streak = 0
+    nogain_streak = 0
 
     for pg in range(1, max_pages + 1):
         url = page_url(base_url, pg)
         print(f"── LIST PAGE {pg}/{max_pages}: {url}")
-
-        page_raw = 0      # listing links seen on this page (after retries)
-        page_gained = 0   # NEW links this page added
+        page_raw = 0
+        page_gained = 0
 
         for attempt in range(3):
             try:
@@ -583,22 +549,16 @@ async def get_all_links(p, base_url, max_pages):
 
             if gained == 0 and pg > 1:
                 if raw_links:
-                    # Page rendered fine — every ad was already collected. The feed
-                    # is sorted newest-first and shifts as new ads post, so later
-                    # pages overlap earlier ones. Not a block; just move on.
                     print(f"   ~ all {len(raw_links)} links already seen (feed shifted) — moving on")
                     break
-                # Truly empty page → likely a block/empty render → retry.
                 wait_secs = (attempt + 1) * 20
                 print(f"   ✗ Empty page — possible block, waiting {wait_secs}s before retry")
                 await asyncio.sleep(wait_secs)
                 continue
-
             break
         else:
             print(f"   ✗ Skipping page {pg} after 3 failed attempts")
 
-        # ── End-of-pagination detection ───────────────────────────
         empty_streak  = empty_streak + 1  if page_raw == 0    else 0
         nogain_streak = nogain_streak + 1 if page_gained == 0 else 0
 
@@ -617,17 +577,15 @@ async def get_all_links(p, base_url, max_pages):
     except Exception:
         pass
     kill_orphan_chrome()
-
     print(f"  Link collection finished: {len(all_links)} unique listings.")
     return list(all_links)
 
 
 # ─────────────────────────────────────────────────────────────────
-# JSON-LD EXTRACTOR  — primary source (server-rendered schema.org data)
+# JSON-LD EXTRACTOR
 # ─────────────────────────────────────────────────────────────────
 
 def _iter_jsonld_objects(parsed):
-    """Yield every dict inside a parsed JSON-LD blob (handles @graph and lists)."""
     stack = [parsed]
     while stack:
         node = stack.pop()
@@ -640,7 +598,6 @@ def _iter_jsonld_objects(parsed):
 
 
 async def extract_from_jsonld(page):
-    """Parse all <script type="application/ld+json"> blocks into our fields."""
     result = {}
     try:
         blobs = await page.evaluate(
@@ -667,15 +624,14 @@ async def extract_from_jsonld(page):
             if not result.get("description") and obj.get("description"):
                 result["description"] = clean(obj.get("description"))
 
-            # Offers → price / currency
             offers = obj.get("offers")
             if isinstance(offers, list):
                 offers = offers[0] if offers else None
             if isinstance(offers, dict):
                 if not result.get("price"):
-                    p = offers.get("price") or offers.get("lowPrice")
-                    if p not in (None, "", 0, "0"):
-                        result["price"] = extract_number(p)
+                    pr = offers.get("price") or offers.get("lowPrice")
+                    if pr not in (None, "", 0, "0"):
+                        result["price"] = extract_number(pr)
                 if not result.get("currency"):
                     cur = (offers.get("priceCurrency") or "").upper()
                     if cur:
@@ -687,7 +643,6 @@ async def extract_from_jsonld(page):
                 if "soldout" in avail or "discontinued" in avail:
                     result["_sold"] = True
 
-            # Address / location
             addr = obj.get("address")
             if not result.get("location") and addr:
                 if isinstance(addr, dict):
@@ -699,12 +654,10 @@ async def extract_from_jsonld(page):
                 elif isinstance(addr, str):
                     result["location"] = clean(addr)
 
-            # Posted date
             for dk in ("datePosted", "datePublished", "validFrom", "uploadDate"):
                 if not result.get("posted_date") and obj.get(dk):
                     result["posted_date"] = clean(str(obj.get(dk)))
 
-            # Area sometimes appears as floorSize on RealEstate types
             if not result.get("area"):
                 fs = obj.get("floorSize")
                 if isinstance(fs, dict) and fs.get("value"):
@@ -715,25 +668,13 @@ async def extract_from_jsonld(page):
 
 
 # ─────────────────────────────────────────────────────────────────
-# PARAMETER LIST EXTRACTOR  — clean, element-wise (no value bleed)
+# PARAMETER LIST EXTRACTOR
 # ─────────────────────────────────────────────────────────────────
 
-# Russian labels we care about. Order matters only for diagnostics; matching is
-# exact-prefix with a non-letter boundary so "Этаж" never matches "Этажность дома".
 PARAM_LABELS = [
-    "Общая площадь",
-    "Жилая площадь",
-    "Площадь кухни",
-    "Количество комнат",
-    "Этажность дома",
-    "Этажей в доме",
-    "Этаж",
-    "Тип жилья",
-    "Тип дома",
-    "Ремонт",
-    "Меблирована",
-    "Комиссия",
-    "Новостройка",
+    "Общая площадь", "Жилая площадь", "Площадь кухни", "Количество комнат",
+    "Этажность дома", "Этажей в доме", "Этаж", "Тип жилья", "Тип дома",
+    "Ремонт", "Меблирована", "Комиссия", "Новостройка",
 ]
 
 _PARAM_JS = """
@@ -743,11 +684,10 @@ _PARAM_JS = """
     for (const lbl of labels) {
         let best = null;
         for (const el of els) {
-            if (el.children.length > 3) continue;          // prefer leaf-ish nodes
+            if (el.children.length > 3) continue;
             const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
             if (!t.startsWith(lbl)) continue;
             const rest = t.slice(lbl.length);
-            // reject if the next char is a Cyrillic letter — means a longer label
             if (/^[А-Яа-яЁё]/.test(rest)) continue;
             if (best === null || t.length < best.length) best = t;
         }
@@ -759,14 +699,6 @@ _PARAM_JS = """
 
 
 async def wait_for_param(page):
-    """Wait for the parameter list to actually render, not a fixed timer.
-
-    Returns as soon as 'Общая площадь' appears in the DOM (~1–2s on a healthy
-    render) instead of always sleeping AD_WAIT_MS. Falls through on timeout —
-    the retry / has_detail check in the main loop still catches empty shells.
-    Many price-on-request ads legitimately lack this label, so a timeout is not
-    treated as failure here.
-    """
     try:
         await page.wait_for_function(
             "() => (document.body && document.body.innerText || '').includes('Общая площадь')",
@@ -778,7 +710,6 @@ async def wait_for_param(page):
 
 
 async def get_params(page):
-    """Return {label: 'value'} for each known parameter, parsed per-element."""
     try:
         raw = await page.evaluate(_PARAM_JS, PARAM_LABELS)
     except Exception as e:
@@ -786,7 +717,6 @@ async def get_params(page):
         return {}
     params = {}
     for lbl, full in (raw or {}).items():
-        # strip the label prefix and any leading ":" / whitespace
         val = clean(str(full)[len(lbl):].lstrip(" : \t"))
         if val:
             params[lbl] = val
@@ -794,14 +724,12 @@ async def get_params(page):
 
 
 # ─────────────────────────────────────────────────────────────────
-# LOCATION EXTRACTOR  — full "City, District/region" from the map block
+# LOCATION EXTRACTOR
 # ─────────────────────────────────────────────────────────────────
 
 _LOCATION_JS = r"""
 () => {
     const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-
-    // 1) Known map/location testids — read the address text directly.
     const sels = [
         '[data-testid="map-aside-section"]',
         '[data-testid="qa-static-ad-map"]',
@@ -816,8 +744,6 @@ _LOCATION_JS = r"""
             if (t && t.length < 160) return {src: s, text: t};
         }
     }
-
-    // 2) Find the LOCATION/Карта/Манзил heading, take the text right after it.
     const heads = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,p,span,div'));
     for (const h of heads) {
         const ht = norm(h.textContent);
@@ -834,11 +760,9 @@ _LOCATION_JS = r"""
 }
 """
 
-
 _BREADCRUMB_JS = r"""
 () => {
     const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-    // Breadcrumb items — the geographic tail is what we want.
     let items = [];
     const bc = document.querySelector('[data-testid="breadcrumbs"], nav[aria-label*="readcrumb" i], ol');
     if (bc) items = Array.from(bc.querySelectorAll('li, a')).map(e => norm(e.textContent)).filter(Boolean);
@@ -848,13 +772,6 @@ _BREADCRUMB_JS = r"""
 
 
 async def get_location(page):
-    """Return (raw_text, src): full location text for the ad.
-
-    Breadcrumb-first: it's server-rendered and present at load, so we read it
-    WITHOUT the expensive full-page scroll. Only if the breadcrumb yields no
-    district do we scroll to mount the lazy map block and fall back to it.
-    """
-    # 1) PRIMARY: breadcrumb — reliable 'City, District', no scroll needed.
     try:
         crumbs = await page.evaluate(_BREADCRUMB_JS)
     except Exception:
@@ -863,8 +780,6 @@ async def get_location(page):
     if bc:
         return bc, "breadcrumb"
 
-    # 2) FALLBACK: scroll to mount the lazy 'Местоположение' map block, then read.
-    #    (olx.uz exposes no map testid, so a full pass guarantees it renders.)
     try:
         await page.evaluate("""async () => {
             const step = 700;
@@ -885,7 +800,6 @@ async def get_location(page):
         res = None
     if res and res.get("text"):
         return clean(res.get("text")), res.get("src")
-
     return None, None
 
 
@@ -894,12 +808,10 @@ _BC_CATEGORY = {"главная", "недвижимость", "квартиры"
 
 
 def _parse_breadcrumb_geo(crumbs):
-    """From breadcrumb items, build 'City, District' (requires a район)."""
     if not crumbs:
         return None
     items = [re.sub(r"^(Продажа|Аренда|Sotuv|Ijara)\s*[-–]\s*", "", c, flags=re.I).strip()
              for c in crumbs]
-    # Collapse consecutive duplicates (breadcrumb yields both <li> and <a>).
     deduped = []
     for c in items:
         if c and (not deduped or deduped[-1] != c):
@@ -907,9 +819,8 @@ def _parse_breadcrumb_geo(crumbs):
     items = deduped
     district = next((c for c in items if "район" in c.lower()), None)
     if not district:
-        return None  # no district → let the map fallback try
+        return None
     region = next((c for c in items if "область" in c.lower()), None)
-    # City = the item immediately before the district, if it's a real place name.
     city = None
     di = items.index(district)
     if di > 0:
@@ -921,15 +832,12 @@ def _parse_breadcrumb_geo(crumbs):
 
 
 async def get_olx_id(page):
-    """OLX's pure-numeric ad id, shown on the page as 'ID: 779712345' / '№ …'."""
     try:
         raw = await page.evaluate(r"""() => {
-            // Prefer an explicit footer element if present.
             for (const el of document.querySelectorAll('[data-cy="ad-footer-bar-section"], [data-testid="ad-footer-bar-section"]')) {
                 const m = (el.innerText || '').match(/(\d{6,12})/);
                 if (m) return m[1];
             }
-            // Otherwise scan body text for an 'ID:'/'№' label followed by digits.
             const bt = document.body ? document.body.innerText : '';
             const m = bt.match(/(?:ID|№)\s*[:№.]?\s*(\d{6,12})/);
             return m ? m[1] : null;
@@ -965,14 +873,11 @@ async def scrape_ad(page, url, diag=False):
     page.on("response", handle_response)
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        # Wait for h1 — signals React rendered. networkidle never settles on OLX.
         try:
             await page.wait_for_selector("h1", timeout=18000)
         except Exception:
             pass
-        # Wait for the ACTUAL parameter text instead of a blind fixed sleep.
         await wait_for_param(page)
-        # Small randomized buffer (kept short; readiness is handled above).
         await page.wait_for_timeout(random.randint(*AD_WAIT_MS))
         await human_scroll(page)
         await asyncio.sleep(0.8)
@@ -985,23 +890,16 @@ async def scrape_ad(page, url, diag=False):
             or "403 error" in body_snippet or "access denied" in body_snippet:
         raise Exception("BLOCKED_403")
 
-    # ── Listing ID (always from the URL) ──────────────────────────
     listing_id = listing_id_from_url(url)
-
-    # ── Detect redirect to a non-listing page (removed/expired ad) ─
     final_url = page.url
     if "/d/obyavlenie/" not in final_url:
         raise NotAListing(f"redirected to {final_url}")
 
-    # ── PRIMARY: JSON-LD ──────────────────────────────────────────
     jd = await extract_from_jsonld(page)
     if jd.get("_sold"):
         raise NotAListing("offer marked sold/discontinued")
 
-    # ── PRIMARY: parameter list (clean, element-wise) ─────────────
     params = await get_params(page)
-
-    # ── OLX's pure-numeric ad id (shown as 'ID: …' on the page) ────
     olx_id = await get_olx_id(page)
 
     if diag:
@@ -1009,9 +907,6 @@ async def scrape_ad(page, url, diag=False):
         print(f"  [DIAG] page_title  : {page_title[:120]}")
         print(f"  [DIAG] listing_id  : {listing_id}   olx_id: {olx_id}")
         print(f"  [DIAG] json-ld keys: {sorted(jd.keys())}")
-        print(f"  [DIAG] json-ld     : "
-              f"title={str(jd.get('title'))[:50]!r} price={jd.get('price')} "
-              f"cur={jd.get('currency')} loc={str(jd.get('location'))[:40]!r}")
         print(f"  [DIAG] params      : {params}")
 
     title       = jd.get("title")
@@ -1031,7 +926,6 @@ async def scrape_ad(page, url, diag=False):
     seller_joined = None
     views        = jd.get("views") or views_holder["value"]
 
-    # ── FALLBACK: DOM selectors for anything still missing ────────
     if not title:
         for sel in ["h1", '[data-cy="ad_title"]', '[data-testid="ad-title"]']:
             try:
@@ -1079,17 +973,13 @@ async def scrape_ad(page, url, diag=False):
         except Exception:
             pass
 
-    # PRIMARY for location: breadcrumb/map block, which carries city + district.
     if not location:
         loc_raw, loc_src = await get_location(page)
         loc_clean = clean_location(loc_raw)
         if diag:
-            print(f"  [DIAG] location    : src={loc_src}")
-            print(f"  [DIAG]   raw       : {loc_raw!r}")
-            print(f"  [DIAG]   cleaned   : {loc_clean!r}")
+            print(f"  [DIAG] location    : src={loc_src} raw={loc_raw!r} cleaned={loc_clean!r}")
         if loc_clean:
             location = loc_clean
-    # Fallback: the city embedded in the page title (city only, no district).
     if not location:
         location = location_from_title(page_title)
 
@@ -1120,7 +1010,6 @@ async def scrape_ad(page, url, diag=False):
             except Exception:
                 pass
 
-    # ── LAST RESORT: infer from description (clean, scoped regex) ──
     if description:
         desc_low = description.lower()
         if not area:
@@ -1166,7 +1055,7 @@ async def scrape_ad(page, url, diag=False):
 
 
 # ─────────────────────────────────────────────────────────────────
-# BROWSER WARMUP  — establish cookies/session before hitting ad pages
+# BROWSER WARMUP
 # ─────────────────────────────────────────────────────────────────
 
 async def warmup_browser(page):
@@ -1181,20 +1070,16 @@ async def warmup_browser(page):
 
 
 # ─────────────────────────────────────────────────────────────────
-# MAIN
+# RUN ORCHESTRATION
 # ─────────────────────────────────────────────────────────────────
 
 _scrape_lock = asyncio.Lock()
 
 
 async def run_scrape():
-    # Guard against overlap: RUN_ON_START calls this directly while the daily
-    # cron may also fire it. Without this, two scrapes run concurrently in the
-    # same process — doubling OLX load, worsening blocks, and losing data.
     if _scrape_lock.locked():
-        print(f"⏭  scrape already in progress — skipping this trigger ({now_str()})")
+        print(f"⏭  scrape already in progress (in-process) — skipping this trigger ({now_str()})")
         return 0
-
     async with _scrape_lock:
         return await _run_scrape_inner()
 
@@ -1206,150 +1091,189 @@ async def _run_scrape_inner():
 
     try:
         engine = get_engine()
-        ensure_table(engine)
-        backfill_locations(engine)
-        print("✓ Database connected.")
     except Exception as e:
         print(f"FATAL DB ERROR: {e}")
         return 0
 
-    batch_data = []
-    ad_counter = 0
-    skipped_removed = 0
-    skipped_recent = 0
-    budget_hit = False
-    start_ts = time.monotonic()
-    budget_secs = MAX_RUNTIME_HOURS * 3600 if MAX_RUNTIME_HOURS > 0 else None
+    lock_conn = try_acquire_run_lock(engine)
+    if lock_conn is None:
+        print(f"⏭  another run holds the DB advisory lock — skipping ({now_str()})")
+        return 0
 
-    async with async_playwright() as p:
-        print("Collecting listing links...")
-        all_links = list(set(await get_all_links(p, BASE_URL, MAX_PAGES)))
-        print(f"\nTotal unique links: {len(all_links)}")
-
-        # ── Resume: drop listings already snapshotted today so we finish today's
-        #    snapshot rather than start over (after a restart, OOM, or budget cut).
-        done_today = load_done_today(engine)
-        if done_today:
-            before = len(all_links)
-            all_links = [l for l in all_links
-                         if listing_id_from_url(l) not in done_today]
-            skipped_recent = before - len(all_links)
-            print(f"  Resume: {skipped_recent} listings already snapshotted today "
-                  f"skipped — {len(all_links)} to scrape this run.")
-
-        browser, page = await make_browser_page(p)
-        await warmup_browser(page)
-
-        for idx, link in enumerate(all_links, start=1):
-            ad_counter += 1
-
-            # ── Wall-clock budget: stop cleanly before bleeding into the next
-            #    daily cron. The next run resumes via load_done_today().
-            if budget_secs and (time.monotonic() - start_ts) > budget_secs:
-                budget_hit = True
-                print(f"\n  ⏲  Reached {MAX_RUNTIME_HOURS:g}h runtime budget at "
-                      f"listing {idx}/{len(all_links)} — stopping cleanly; "
-                      f"next run resumes the rest.\n")
-                break
-
-            if idx > 1 and (idx - 1) % BROWSER_RESTART_EVERY == 0:
-                print(f"\n  ── restarting browser at listing {idx} ──\n")
-                browser, page = await restart_browser(p, browser)
-                await warmup_browser(page)
-
-            print(f"[{idx}/{len(all_links)}] {link.split('/')[-1][:60]}")
-            diag = ad_counter <= DIAG_DUMP
-            data = None
-            skip_permanently = False
-
-            for attempt in range(AD_ATTEMPTS):
-                try:
-                    data = await scrape_ad(page, link, diag=diag)
-                    # A real render yields a title AND at least one structured
-                    # detail (price / area / rooms). Price alone is NOT required:
-                    # many listings are price-on-request / договорная, and gating
-                    # on price made those retry and get discarded every run — the
-                    # main reason a run never finished. An empty React shell
-                    # (title from <title> but no params) still retries.
-                    has_detail = data and (
-                        data.get("price") or data.get("area") or data.get("num_rooms")
-                    )
-                    if data and not (data.get("title") and has_detail):
-                        raise Exception("RENDER_FAILED")
-                    break
-                except NotAListing as e:
-                    print(f"  ⏭  skipped (not a listing): {e}")
-                    skip_permanently = True
-                    data = None
-                    break
-                except Exception as e:
-                    err = str(e)
-                    if "BLOCKED_403" in err:
-                        wait = (attempt + 1) * 30
-                        print(f"  BLOCKED — retry {attempt+1}/{AD_ATTEMPTS} in {wait}s")
-                        await asyncio.sleep(wait)
-                    elif "RENDER_FAILED" in err:
-                        wait = (attempt + 1) * 10
-                        print(f"  Page rendered incomplete — retry {attempt+1}/{AD_ATTEMPTS} in {wait}s")
-                        await asyncio.sleep(wait)
-                        data = None
-                    elif any(x in err for x in [
-                        "Target page", "browser has been closed",
-                        "page has been closed", "Browser closed",
-                        "context or browser", "Target closed",
-                        "Timeout", "timeout", "Page crashed", "crashed",
-                    ]):
-                        print(f"  Browser crashed/timeout — restarting (attempt {attempt+1}/{AD_ATTEMPTS})")
-                        browser, page = await restart_browser(p, browser)
-                        await warmup_browser(page)
-                    else:
-                        print(f"  FAILED: {e}")
-                        break
-
-            if skip_permanently:
-                skipped_removed += 1
-            elif data:
-                batch_data.append(data)
-                print(
-                    f"  ✓  rooms={data['num_rooms']}  area={data['area']}  "
-                    f"floor={data['stair']}/{data['total_floors']}  "
-                    f"price={data['price']} {data['currency']}  "
-                    f"type={str(data['market_type'])[:18]}  loc={str(data['location'])[:30]}"
-                )
-            else:
-                print("  ✗ skipped (incomplete after retries)")
-
-            if len(batch_data) >= BATCH_SIZE:
-                save_batch_to_db(batch_data, engine)
-                batch_data.clear()
-
-            # Flush the heavy SPA heap before the next ad (cheap GC, no restart).
-            await flush_page(page)
-
-            await short_delay(*BETWEEN_ADS)
-
-            if ad_counter % LONG_BREAK_EVERY == 0:
-                secs = random.uniform(*LONG_BREAK_SECS)
-                print(f"\n  ── pause {secs:.0f}s ──\n")
-                await asyncio.sleep(secs)
-
+    try:
         try:
-            await browser.close()
-        except Exception:
-            pass
-        kill_orphan_chrome()
+            ensure_table(engine)
+            backfill_locations(engine)
+            print("✓ Database connected.")
+        except Exception as e:
+            print(f"FATAL DB ERROR: {e}")
+            return 0
 
-    if batch_data:
-        save_batch_to_db(batch_data, engine)
+        batch_data = []
+        ad_counter = 0
+        skipped_removed = 0
+        skipped_recent = 0
+        budget_hit = False
+        start_ts = time.monotonic()
+        budget_secs = MAX_RUNTIME_HOURS * 3600 if MAX_RUNTIME_HOURS > 0 else None
 
-    status = "STOPPED (budget)" if budget_hit else "DONE"
-    elapsed_h = (time.monotonic() - start_ts) / 3600
-    print(f"\n{'='*55}")
-    print(f"  {status}  —  {ad_counter} ads processed, {skipped_removed} removed/skipped, "
-          f"{skipped_recent} resumed-skip  —  {elapsed_h:.1f}h  —  {now_str()}")
-    print(f"{'='*55}\n")
-    return ad_counter
+        async with async_playwright() as p:
+            print("Collecting listing links...")
+            all_links = list(set(await get_all_links(p, BASE_URL, MAX_PAGES)))
+            print(f"\nTotal unique links: {len(all_links)}")
+
+            done_today = load_done_today(engine)
+            if done_today:
+                before = len(all_links)
+                all_links = [l for l in all_links
+                             if listing_id_from_url(l) not in done_today]
+                skipped_recent = before - len(all_links)
+                print(f"  Resume: {skipped_recent} listings already snapshotted today "
+                      f"skipped — {len(all_links)} to scrape this run.")
+
+            browser, page = await make_browser_page(p)
+            await warmup_browser(page)
+
+            for idx, link in enumerate(all_links, start=1):
+                ad_counter += 1
+
+                if budget_secs and (time.monotonic() - start_ts) > budget_secs:
+                    budget_hit = True
+                    print(f"\n  ⏲  Reached {MAX_RUNTIME_HOURS:g}h runtime budget at "
+                          f"listing {idx}/{len(all_links)} — stopping cleanly; "
+                          f"next run resumes the rest.\n")
+                    break
+
+                if idx > 1 and (idx - 1) % BROWSER_RESTART_EVERY == 0:
+                    print(f"\n  ── restarting browser at listing {idx} ──\n")
+                    browser, page = await restart_browser(p, browser)
+                    await warmup_browser(page)
+
+                print(f"[{idx}/{len(all_links)}] {link.split('/')[-1][:60]}")
+                diag = ad_counter <= DIAG_DUMP
+                data = None
+                skip_permanently = False
+
+                for attempt in range(AD_ATTEMPTS):
+                    try:
+                        data = await scrape_ad(page, link, diag=diag)
+                        has_detail = data and (
+                            data.get("price") or data.get("area") or data.get("num_rooms")
+                        )
+                        if data and not (data.get("title") and has_detail):
+                            raise Exception("RENDER_FAILED")
+                        break
+                    except NotAListing as e:
+                        print(f"  ⏭  skipped (not a listing): {e}")
+                        skip_permanently = True
+                        data = None
+                        break
+                    except Exception as e:
+                        err = str(e)
+                        if "BLOCKED_403" in err:
+                            wait = (attempt + 1) * 30
+                            print(f"  BLOCKED — retry {attempt+1}/{AD_ATTEMPTS} in {wait}s")
+                            await asyncio.sleep(wait)
+                        elif "RENDER_FAILED" in err:
+                            wait = (attempt + 1) * 10
+                            print(f"  Page rendered incomplete — retry {attempt+1}/{AD_ATTEMPTS} in {wait}s")
+                            await asyncio.sleep(wait)
+                            data = None
+                        elif any(x in err for x in [
+                            "Target page", "browser has been closed",
+                            "page has been closed", "Browser closed",
+                            "context or browser", "Target closed",
+                            "Timeout", "timeout", "Page crashed", "crashed",
+                        ]):
+                            print(f"  Browser crashed/timeout — restarting (attempt {attempt+1}/{AD_ATTEMPTS})")
+                            browser, page = await restart_browser(p, browser)
+                            await warmup_browser(page)
+                        else:
+                            print(f"  FAILED: {e}")
+                            break
+
+                if skip_permanently:
+                    skipped_removed += 1
+                elif data:
+                    batch_data.append(data)
+                    print(
+                        f"  ✓  rooms={data['num_rooms']}  area={data['area']}  "
+                        f"floor={data['stair']}/{data['total_floors']}  "
+                        f"price={data['price']} {data['currency']}  "
+                        f"type={str(data['market_type'])[:18]}  loc={str(data['location'])[:30]}"
+                    )
+                else:
+                    print("  ✗ skipped (incomplete after retries)")
+
+                if len(batch_data) >= BATCH_SIZE:
+                    save_batch_to_db(batch_data, engine)
+                    batch_data.clear()
+
+                await flush_page(page)
+                await short_delay(*BETWEEN_ADS)
+
+                if ad_counter % LONG_BREAK_EVERY == 0:
+                    secs = random.uniform(*LONG_BREAK_SECS)
+                    print(f"\n  ── pause {secs:.0f}s ──\n")
+                    await asyncio.sleep(secs)
+
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            kill_orphan_chrome()
+
+        if batch_data:
+            save_batch_to_db(batch_data, engine)
+
+        status = "STOPPED (budget)" if budget_hit else "DONE"
+        elapsed_h = (time.monotonic() - start_ts) / 3600
+        print(f"\n{'='*55}")
+        print(f"  {status}  —  {ad_counter} ads processed, {skipped_removed} removed/skipped, "
+              f"{skipped_recent} resumed-skip  —  {elapsed_h:.1f}h  —  {now_str()}")
+        print(f"{'='*55}\n")
+        return ad_counter
+    finally:
+        release_run_lock(lock_conn)
+
+
+# ─────────────────────────────────────────────────────────────────
+# ENTRYPOINT  — SINGLE scheduler. No double-trigger.
+#
+# Reads RUN_ON_START and SCRAPE_HOUR from env (your existing Railway vars).
+# The boot run (if enabled) is awaited in the SAME event loop as the cron, so
+# the in-process _scrape_lock genuinely protects against overlap. max_instances=1
+# is a second backstop; the Postgres advisory lock is a third (replicas/handoffs).
+#
+# TIMEZONE: SCRAPE_HOUR is interpreted in TZ_NAME (default Asia/Tashkent). Set
+# TZ_NAME=UTC if you actually want UTC.
+# ─────────────────────────────────────────────────────────────────
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+RUN_ON_START = os.getenv("RUN_ON_START", "false").lower() == "true"
+SCRAPE_HOUR  = int(os.getenv("SCRAPE_HOUR", "6"))
+SCRAPE_MIN   = int(os.getenv("SCRAPE_MIN", "0"))
+TZ_NAME      = os.getenv("TZ_NAME", "Asia/Tashkent")
+
+
+async def _main():
+    scheduler = AsyncIOScheduler(timezone=TZ_NAME)
+    scheduler.add_job(
+        run_scrape, "cron",
+        hour=SCRAPE_HOUR, minute=SCRAPE_MIN,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
+    scheduler.start()
+    print(f"Scheduler started — daily at {SCRAPE_HOUR:02d}:{SCRAPE_MIN:02d} {TZ_NAME} "
+          f"(run_on_start={RUN_ON_START}).")
+
+    if RUN_ON_START:
+        await run_scrape()
+
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    asyncio.run(run_scrape())
+    asyncio.run(_main())
