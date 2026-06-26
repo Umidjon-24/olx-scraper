@@ -61,19 +61,6 @@ except Exception:
     _HAVE_PSUTIL = False
 
 
-# ─────────────────────────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────────────────────────
-BASE_URL   = os.getenv("OLX_BASE_URL", "https://www.olx.uz/nedvizhimost/kvartiry/prodazha/?currency=UZS")
-MAX_PAGES  = int(os.getenv("MAX_PAGES", "25"))
-
-DB_USER    = os.environ.get("DB_USER")
-DB_PASS    = os.environ.get("DB_PASS")
-DB_HOST    = os.environ.get("DB_HOST", "aws-0-ap-southeast-1.pooler.supabase.com")
-DB_PORT    = os.environ.get("DB_PORT", "5432")
-DB_NAME    = os.environ.get("DB_NAME", "postgres")
-TABLE_NAME = os.getenv("TABLE_NAME", "olx_listings")
-
 # How many of the first ads to dump full diagnostics for (set DIAG_DUMP>0 to enable).
 DIAG_DUMP  = int(os.getenv("DIAG_DUMP", "0"))
 
