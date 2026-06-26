@@ -1,8 +1,5 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
-  "build": {
-    "buildCommand": "playwright install --with-deps chromium"
-  },
   "deploy": {
     "startCommand": "python olx_scraper.py",
     "restartPolicyType": "ON_FAILURE"
