@@ -4,3 +4,5 @@ sqlalchemy
 psycopg2-binary
 openpyxl
 schedule
+psutil
+apscheduler
