@@ -74,8 +74,11 @@ MAX_RUNTIME_HOURS = float(os.getenv("MAX_RUNTIME_HOURS", "22"))
 # ─────────────────────────────────────────────────────────────────
 # TIMING
 # ─────────────────────────────────────────────────────────────────
-AD_WAIT_MS            = (1200, 2500)  # small buffer; real readiness is wait_for_param()
-PARAM_WAIT_MS         = 8000          # max wait for the parameter text to render
+AD_WAIT_MS            = (600, 1200)   # small settle once content is already ready
+# Readiness budgets (the slow part used to be three blind sequential waits).
+READY_WAIT_MS         = int(os.getenv("READY_WAIT_MS", "15000"))   # overall ceiling to get usable content
+CHALLENGE_WAIT_MS     = int(os.getenv("CHALLENGE_WAIT_MS", "12000"))  # let a Cloudflare interstitial self-resolve
+PARAM_WAIT_MS         = int(os.getenv("PARAM_WAIT_MS", "3500"))    # bounded; many valid ads lack 'Общая площадь'
 BETWEEN_ADS           = (2.0, 4.0)    # ← the real rate limiter; raise this first if 403s rise
 BETWEEN_LIST          = (4.5, 9.0)
 LONG_BREAK_EVERY      = 22
@@ -856,6 +859,96 @@ class NotAListing(Exception):
     """Raised when a URL redirects away from an ad (removed/expired) — skip it."""
 
 
+# Cloudflare/anti-bot interstitials that AUTO-RESOLVE if we just wait with JS on.
+# These are NOT hard blocks — the previous code wrongly treated "just a moment"
+# as a 403 and slept 60s, then re-navigated, paying the challenge cost twice.
+_CHALLENGE_MARKERS = (
+    "just a moment", "checking your browser", "checking if the site connection",
+    "verifying you are human", "verify you are human", "needs to review the security",
+    "проверяем, человек ли", "подождите", "attention required",
+    "cf-browser-verification", "challenge-platform", "_cf_chl", "cf_chl",
+)
+# Genuine dead-ends — no point waiting, back off and retry later (longer cooldown).
+_HARD_BLOCK_MARKERS = (
+    "403 error", "error 403", "access denied", "доступ запрещ", "forbidden",
+)
+
+
+async def _quick_state(page):
+    """Cheap read of title + a small slice of body text for block/challenge detection."""
+    try:
+        title = (await page.title() or "").lower()
+    except Exception:
+        title = ""
+    try:
+        body = (await page.evaluate(
+            "() => (document.body && document.body.innerText || '').slice(0, 500)"
+        ) or "").lower()
+    except Exception:
+        body = ""
+    return title, body
+
+
+async def _content_ready(page):
+    """Readiness signal that can't be faked by an interstitial.
+
+    Returns 'jsonld' if the server-rendered ad JSON-LD is present (only ever
+    exists on a real ad page), 'h1' if a non-empty h1 exists, else ''.
+    The caller treats a bare 'h1' as ready ONLY when no challenge is showing.
+    """
+    try:
+        return await page.evaluate("""() => {
+            if (document.querySelector('script[type="application/ld+json"]')) return 'jsonld';
+            const h = document.querySelector('h1');
+            return (h && (h.innerText || '').trim().length > 0) ? 'h1' : '';
+        }""")
+    except Exception:
+        return ''
+
+
+async def wait_for_ready(page):
+    """Poll until the ad is usable, transparently sitting through a Cloudflare
+    interstitial if one shows up.
+
+    Returns one of:
+      'ready'   — JSON-LD / h1 present, safe to extract.
+      'blocked' — hard 403 / access-denied; bail fast and back off longer.
+      'timeout' — nothing usable within READY_WAIT_MS; caller retries quickly.
+
+    This replaces the old blind sequence (wait_for_selector h1 18s →
+    wait_for_param 8s → fixed sleeps → late block check), which burned ~26s+
+    BEFORE it even noticed a block.
+    """
+    deadline = time.monotonic() + READY_WAIT_MS / 1000
+    challenge_until = None  # set when we first see an interstitial
+
+    while time.monotonic() < deadline:
+        title, body = await _quick_state(page)
+        on_challenge = any(m in title or m in body for m in _CHALLENGE_MARKERS)
+
+        signal = await _content_ready(page)
+        # JSON-LD only exists on a genuine ad page; an h1 alone is trusted only
+        # when no interstitial text is present (the challenge page has its own h1).
+        if signal == "jsonld" or (signal == "h1" and not on_challenge):
+            return "ready"
+
+        if any(m in title or m in body for m in _HARD_BLOCK_MARKERS):
+            return "blocked"
+
+        if on_challenge:
+            # First sighting starts a bounded patience window; the JS solver
+            # typically clears it in a few seconds. We keep polling _content_ready.
+            now = time.monotonic()
+            if challenge_until is None:
+                challenge_until = now + CHALLENGE_WAIT_MS / 1000
+            elif now > challenge_until:
+                return "timeout"  # interstitial never cleared — quick retry
+
+        await page.wait_for_timeout(400)
+
+    return "timeout"
+
+
 async def scrape_ad(page, url, diag=False):
     views_holder = {"value": None}
 
@@ -871,24 +964,29 @@ async def scrape_ad(page, url, diag=False):
             pass
 
     page.on("response", handle_response)
+    t0 = time.monotonic()
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        try:
-            await page.wait_for_selector("h1", timeout=18000)
-        except Exception:
-            pass
-        await wait_for_param(page)
+        # Detect blocks/challenges FAST and let CF interstitials self-resolve,
+        # instead of paying ~26s of blind waits before noticing a problem.
+        state = await wait_for_ready(page)
+        if state == "blocked":
+            raise Exception("BLOCKED_403")
+        if state == "timeout":
+            # Nothing usable yet — surface as RENDER_FAILED so the caller does a
+            # short, cheap retry rather than the old 30/60/90s block backoff.
+            raise Exception("RENDER_FAILED")
+        # Content is present. Brief settle + a single scroll so lazy blocks
+        # (params, map, footer id) finish painting, then a bounded param wait.
+        await human_scroll(page, fast=True)
         await page.wait_for_timeout(random.randint(*AD_WAIT_MS))
-        await human_scroll(page)
-        await asyncio.sleep(0.8)
+        await wait_for_param(page)  # now bounded to PARAM_WAIT_MS (~3.5s), not 8s
     finally:
         page.remove_listener("response", handle_response)
+        if diag:
+            print(f"  [DIAG] ready in {time.monotonic() - t0:.1f}s")
 
     page_title = await page.title()
-    body_snippet = (await page.text_content("body") or "")[:600].lower()
-    if any(x in page_title.lower() for x in ["403", "access denied", "captcha", "just a moment"]) \
-            or "403 error" in body_snippet or "access denied" in body_snippet:
-        raise Exception("BLOCKED_403")
 
     listing_id = listing_id_from_url(url)
     final_url = page.url
@@ -1171,11 +1269,16 @@ async def _run_scrape_inner():
                     except Exception as e:
                         err = str(e)
                         if "BLOCKED_403" in err:
-                            wait = (attempt + 1) * 30
+                            # Genuine 403/access-denied (not a CF interstitial —
+                            # those are now waited out inside scrape_ad). IP may be
+                            # flagged, so cool down progressively.
+                            wait = 15 * (attempt + 1)
                             print(f"  BLOCKED — retry {attempt+1}/{AD_ATTEMPTS} in {wait}s")
                             await asyncio.sleep(wait)
                         elif "RENDER_FAILED" in err:
-                            wait = (attempt + 1) * 10
+                            # Content was reachable but not ready in time; a fresh
+                            # navigation usually fixes it. Retry fast, escalate gently.
+                            wait = 2 + attempt * 3
                             print(f"  Page rendered incomplete — retry {attempt+1}/{AD_ATTEMPTS} in {wait}s")
                             await asyncio.sleep(wait)
                             data = None
