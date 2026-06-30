@@ -1212,139 +1212,168 @@ async def _run_scrape_inner():
 
         batch_data = []
         ad_counter = 0
+        saved_total = 0
         skipped_removed = 0
         skipped_recent = 0
+        skipped_dupe = 0
         budget_hit = False
         start_ts = time.monotonic()
         budget_secs = MAX_RUNTIME_HOURS * 3600 if MAX_RUNTIME_HOURS > 0 else None
 
         async with async_playwright() as p:
-            print(f"Collecting listing links from {len(BASE_URLS)} source url(s)...")
-            link_set = set()
-            for si, b in enumerate(BASE_URLS, start=1):
-                print(f"\n=== SOURCE {si}/{len(BASE_URLS)} (up to {MAX_PAGES} pages): {b}")
-                before = len(link_set)
-                links = await get_all_links(p, b, MAX_PAGES)
-                link_set.update(links)
-                print(f"  Source {si} added {len(link_set) - before} new "
-                      f"(running total {len(link_set)}).")
-            all_links = list(link_set)
-            print(f"\nTotal unique links across all sources: {len(all_links)}")
-
             done_today = load_done_today(engine)
             if done_today:
-                before = len(all_links)
-                all_links = [l for l in all_links
-                             if listing_id_from_url(l) not in done_today]
-                skipped_recent = before - len(all_links)
-                print(f"  Resume: {skipped_recent} listings already snapshotted today "
-                      f"skipped — {len(all_links)} to scrape this run.")
+                print(f"  Resume: {len(done_today)} listings already snapshotted today "
+                      f"will be skipped.")
+            seen_ids = set()  # cross-source dedup WITHIN this run (a listing in two districts)
 
-            browser, page = await make_browser_page(p)
-            await warmup_browser(page)
-
-            for idx, link in enumerate(all_links, start=1):
-                ad_counter += 1
-
-                if budget_secs and (time.monotonic() - start_ts) > budget_secs:
-                    budget_hit = True
-                    print(f"\n  ⏲  Reached {MAX_RUNTIME_HOURS:g}h runtime budget at "
-                          f"listing {idx}/{len(all_links)} — stopping cleanly; "
-                          f"next run resumes the rest.\n")
+            for si, base in enumerate(BASE_URLS, start=1):
+                if budget_hit:
                     break
 
-                if idx > 1 and (idx - 1) % BROWSER_RESTART_EVERY == 0:
-                    print(f"\n  ── restarting browser at listing {idx} ──\n")
-                    browser, page = await restart_browser(p, browser)
-                    await warmup_browser(page)
+                print(f"\n=== SOURCE {si}/{len(BASE_URLS)} (up to {MAX_PAGES} pages): {base}")
 
-                print(f"[{idx}/{len(all_links)}] {link.split('/')[-1][:60]}")
-                diag = ad_counter <= DIAG_DUMP
-                data = None
-                skip_permanently = False
+                # 1) Collect this source's links (get_all_links opens+closes its OWN browser).
+                src_all = await get_all_links(p, base, MAX_PAGES)
 
-                for attempt in range(AD_ATTEMPTS):
-                    try:
-                        data = await scrape_ad(page, link, diag=diag)
-                        has_detail = data and (
-                            data.get("price") or data.get("area") or data.get("num_rooms")
-                        )
-                        if data and not (data.get("title") and has_detail):
-                            raise Exception("RENDER_FAILED")
+                # 2) Drop ones already done today or already scraped from an earlier source.
+                src_links = []
+                for l in src_all:
+                    lid = listing_id_from_url(l)
+                    if lid and lid in done_today:
+                        skipped_recent += 1
+                        continue
+                    if lid and lid in seen_ids:
+                        skipped_dupe += 1
+                        continue
+                    src_links.append(l)
+
+                print(f"  Source {si}: {len(src_all)} found — {len(src_links)} new to scrape "
+                      f"(skipped {len(src_all) - len(src_links)}: done-today/duplicate).")
+                if not src_links:
+                    continue
+
+                # 3) Scrape this source fully, with its OWN ad browser (no overlap with the
+                #    link-collection browser, which is already closed).
+                browser, page = await make_browser_page(p)
+                await warmup_browser(page)
+
+                for j, link in enumerate(src_links, start=1):
+                    ad_counter += 1
+
+                    if budget_secs and (time.monotonic() - start_ts) > budget_secs:
+                        budget_hit = True
+                        print(f"\n  ⏲  Reached {MAX_RUNTIME_HOURS:g}h runtime budget at "
+                              f"source {si}, listing {j}/{len(src_links)} — stopping cleanly; "
+                              f"next run resumes the rest.\n")
                         break
-                    except NotAListing as e:
-                        print(f"  ⏭  skipped (not a listing): {e}")
-                        skip_permanently = True
-                        data = None
-                        break
-                    except Exception as e:
-                        err = str(e)
-                        if "BLOCKED_403" in err:
-                            # Genuine 403/access-denied (not a CF interstitial —
-                            # those are now waited out inside scrape_ad). IP may be
-                            # flagged, so cool down progressively.
-                            wait = 15 * (attempt + 1)
-                            print(f"  BLOCKED — retry {attempt+1}/{AD_ATTEMPTS} in {wait}s")
-                            await asyncio.sleep(wait)
-                        elif "RENDER_FAILED" in err:
-                            # Content was reachable but not ready in time; a fresh
-                            # navigation usually fixes it. Retry fast, escalate gently.
-                            wait = 2 + attempt * 3
-                            print(f"  Page rendered incomplete — retry {attempt+1}/{AD_ATTEMPTS} in {wait}s")
-                            await asyncio.sleep(wait)
-                            data = None
-                        elif any(x in err for x in [
-                            "Target page", "browser has been closed",
-                            "page has been closed", "Browser closed",
-                            "context or browser", "Target closed",
-                            "Timeout", "timeout", "Page crashed", "crashed",
-                        ]):
-                            print(f"  Browser crashed/timeout — restarting (attempt {attempt+1}/{AD_ATTEMPTS})")
-                            browser, page = await restart_browser(p, browser)
-                            await warmup_browser(page)
-                        else:
-                            print(f"  FAILED: {e}")
+
+                    # Browser restart cadence is per-source (browser is fresh at j=1).
+                    if j > 1 and (j - 1) % BROWSER_RESTART_EVERY == 0:
+                        print(f"\n  ── restarting browser at source {si} listing {j} ──\n")
+                        browser, page = await restart_browser(p, browser)
+                        await warmup_browser(page)
+
+                    lid = listing_id_from_url(link)
+                    print(f"[S{si} {j}/{len(src_links)} | total {ad_counter}] "
+                          f"{link.split('/')[-1][:60]}")
+                    diag = ad_counter <= DIAG_DUMP
+                    data = None
+                    skip_permanently = False
+
+                    for attempt in range(AD_ATTEMPTS):
+                        try:
+                            data = await scrape_ad(page, link, diag=diag)
+                            has_detail = data and (
+                                data.get("price") or data.get("area") or data.get("num_rooms")
+                            )
+                            if data and not (data.get("title") and has_detail):
+                                raise Exception("RENDER_FAILED")
                             break
+                        except NotAListing as e:
+                            print(f"  ⏭  skipped (not a listing): {e}")
+                            skip_permanently = True
+                            data = None
+                            break
+                        except Exception as e:
+                            err = str(e)
+                            if "BLOCKED_403" in err:
+                                # Genuine 403/access-denied (not a CF interstitial —
+                                # those are now waited out inside scrape_ad). IP may be
+                                # flagged, so cool down progressively.
+                                wait = 15 * (attempt + 1)
+                                print(f"  BLOCKED — retry {attempt+1}/{AD_ATTEMPTS} in {wait}s")
+                                await asyncio.sleep(wait)
+                            elif "RENDER_FAILED" in err:
+                                # Content was reachable but not ready in time; a fresh
+                                # navigation usually fixes it. Retry fast, escalate gently.
+                                wait = 2 + attempt * 3
+                                print(f"  Page rendered incomplete — retry {attempt+1}/{AD_ATTEMPTS} in {wait}s")
+                                await asyncio.sleep(wait)
+                                data = None
+                            elif any(x in err for x in [
+                                "Target page", "browser has been closed",
+                                "page has been closed", "Browser closed",
+                                "context or browser", "Target closed",
+                                "Timeout", "timeout", "Page crashed", "crashed",
+                            ]):
+                                print(f"  Browser crashed/timeout — restarting (attempt {attempt+1}/{AD_ATTEMPTS})")
+                                browser, page = await restart_browser(p, browser)
+                                await warmup_browser(page)
+                            else:
+                                print(f"  FAILED: {e}")
+                                break
 
-                if skip_permanently:
-                    skipped_removed += 1
-                elif data:
-                    batch_data.append(data)
-                    print(
-                        f"  ✓  rooms={data['num_rooms']}  area={data['area']}  "
-                        f"floor={data['stair']}/{data['total_floors']}  "
-                        f"price={data['price']} {data['currency']}  "
-                        f"type={str(data['market_type'])[:18]}  loc={str(data['location'])[:30]}"
-                    )
-                else:
-                    print("  ✗ skipped (incomplete after retries)")
+                    # Mark seen regardless of outcome so a later source never re-attempts it.
+                    if lid:
+                        seen_ids.add(lid)
 
-                if len(batch_data) >= BATCH_SIZE:
-                    save_batch_to_db(batch_data, engine)
-                    batch_data.clear()
+                    if skip_permanently:
+                        skipped_removed += 1
+                    elif data:
+                        batch_data.append(data)
+                        print(
+                            f"  ✓  rooms={data['num_rooms']}  area={data['area']}  "
+                            f"floor={data['stair']}/{data['total_floors']}  "
+                            f"price={data['price']} {data['currency']}  "
+                            f"type={str(data['market_type'])[:18]}  loc={str(data['location'])[:30]}"
+                        )
+                    else:
+                        print("  ✗ skipped (incomplete after retries)")
 
-                await flush_page(page)
-                await short_delay(*BETWEEN_ADS)
+                    if len(batch_data) >= BATCH_SIZE:
+                        save_batch_to_db(batch_data, engine)
+                        saved_total += len(batch_data)
+                        batch_data.clear()
 
-                if ad_counter % LONG_BREAK_EVERY == 0:
-                    secs = random.uniform(*LONG_BREAK_SECS)
-                    print(f"\n  ── pause {secs:.0f}s ──\n")
-                    await asyncio.sleep(secs)
+                    await flush_page(page)
+                    await short_delay(*BETWEEN_ADS)
 
-            try:
-                await browser.close()
-            except Exception:
-                pass
-            kill_orphan_chrome()
+                    if ad_counter % LONG_BREAK_EVERY == 0:
+                        secs = random.uniform(*LONG_BREAK_SECS)
+                        print(f"\n  ── pause {secs:.0f}s ──\n")
+                        await asyncio.sleep(secs)
+
+                # Source finished (or budget hit) — tear down this source's ad browser
+                # before collecting the next source's links, so only one browser is ever alive.
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                kill_orphan_chrome()
+                print(f"  ── source {si} done ──")
 
         if batch_data:
             save_batch_to_db(batch_data, engine)
+            saved_total += len(batch_data)
+            batch_data.clear()
 
         status = "STOPPED (budget)" if budget_hit else "DONE"
         elapsed_h = (time.monotonic() - start_ts) / 3600
         print(f"\n{'='*55}")
-        print(f"  {status}  —  {ad_counter} ads processed, {skipped_removed} removed/skipped, "
-              f"{skipped_recent} resumed-skip  —  {elapsed_h:.1f}h  —  {now_str()}")
+        print(f"  {status}  —  {ad_counter} ads processed, {saved_total} saved, "
+              f"{skipped_removed} removed/skipped, {skipped_recent} resumed-skip, "
+              f"{skipped_dupe} cross-source dupes  —  {elapsed_h:.1f}h  —  {now_str()}")
         print(f"{'='*55}\n")
         return ad_counter
     finally:
