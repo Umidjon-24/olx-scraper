@@ -53,6 +53,9 @@ except Exception:
 # CONFIG  — all read from environment variables (set these in Railway).
 # ─────────────────────────────────────────────────────────────────
 BASE_URL   = os.getenv("OLX_BASE_URL", "https://www.olx.uz/nedvizhimost/kvartiry/prodazha/?currency=UZS")
+# OLX_BASE_URL may hold SEVERAL urls separated by newlines, spaces, or commas.
+# Each is crawled for up to MAX_PAGES pages, then all links are merged + deduped.
+BASE_URLS  = [u for u in re.split(r"[\s,]+", BASE_URL.strip()) if u.startswith("http")] or [BASE_URL]
 MAX_PAGES  = int(os.getenv("MAX_PAGES", "25"))
 
 DB_USER    = os.environ.get("DB_USER")
@@ -1216,9 +1219,17 @@ async def _run_scrape_inner():
         budget_secs = MAX_RUNTIME_HOURS * 3600 if MAX_RUNTIME_HOURS > 0 else None
 
         async with async_playwright() as p:
-            print("Collecting listing links...")
-            all_links = list(set(await get_all_links(p, BASE_URL, MAX_PAGES)))
-            print(f"\nTotal unique links: {len(all_links)}")
+            print(f"Collecting listing links from {len(BASE_URLS)} source url(s)...")
+            link_set = set()
+            for si, b in enumerate(BASE_URLS, start=1):
+                print(f"\n=== SOURCE {si}/{len(BASE_URLS)} (up to {MAX_PAGES} pages): {b}")
+                before = len(link_set)
+                links = await get_all_links(p, b, MAX_PAGES)
+                link_set.update(links)
+                print(f"  Source {si} added {len(link_set) - before} new "
+                      f"(running total {len(link_set)}).")
+            all_links = list(link_set)
+            print(f"\nTotal unique links across all sources: {len(all_links)}")
 
             done_today = load_done_today(engine)
             if done_today:
