@@ -63,7 +63,7 @@ DB_PASS    = os.environ.get("DB_PASS")
 DB_HOST    = os.environ.get("DB_HOST", "aws-0-ap-southeast-1.pooler.supabase.com")
 DB_PORT    = os.environ.get("DB_PORT", "5432")
 DB_NAME    = os.environ.get("DB_NAME", "postgres")
-TABLE_NAME = os.getenv("TABLE_NAME", "olx_listings")
+TABLE_NAME = os.getenv("TABLE_NAME", "olx_v3")
 
 # How many of the first ads to dump full diagnostics for (set DIAG_DUMP>0 to enable).
 DIAG_DUMP  = int(os.getenv("DIAG_DUMP", "0"))
@@ -83,7 +83,7 @@ READY_WAIT_MS         = int(os.getenv("READY_WAIT_MS", "15000"))   # overall cei
 CHALLENGE_WAIT_MS     = int(os.getenv("CHALLENGE_WAIT_MS", "12000"))  # let a Cloudflare interstitial self-resolve
 PARAM_WAIT_MS         = int(os.getenv("PARAM_WAIT_MS", "3500"))    # bounded; many valid ads lack 'Общая площадь'
 BETWEEN_ADS           = (2.0, 4.0)    # ← the real rate limiter; raise this first if 403s rise
-BETWEEN_LIST          = (4.5, 9.0)
+BETWEEN_LIST          = (6.0, 9.0)
 LONG_BREAK_EVERY      = 22
 LONG_BREAK_SECS       = (13, 22)
 SCROLL_PASSES         = (1, 2)
