@@ -211,21 +211,87 @@ async def flush_page(page):
         pass
 
 
+def reap_zombies():
+    """Wait() on any dead children reparented to us (PID 1 in the container).
+
+    ROOT CAUSE FIX. When Playwright's node driver dies or a browser is torn down
+    uncleanly, orphaned Chromium processes reparent to PID 1 — this Python
+    process. If we never waitpid() them they become <defunct> zombies that
+    SIGKILL cannot clear (they're already dead), so the count only ever grows.
+    The logs showed ~600 such processes pinned for the whole run, starving the
+    container and causing the incomplete renders. Reaping them here is the fix.
+    """
+    reaped = 0
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            break          # no children left to wait on
+        except Exception:
+            break
+        if pid == 0:
+            break          # children exist but none have exited yet
+        reaped += 1
+    return reaped
+
+
+async def _zombie_reaper_loop(interval=10):
+    """Background task: continuously reap dead children so they never pile up."""
+    while True:
+        try:
+            n = reap_zombies()
+            if n:
+                print(f"  [mem] reaped {n} dead child process(es)")
+        except Exception:
+            pass
+        await asyncio.sleep(interval)
+
+
 def kill_orphan_chrome():
-    """SIGKILL leftover Chromium processes. Safe only between browsers."""
+    """Terminate leftover Chromium trees, then reap them. Safe only between browsers.
+
+    Two-phase and gentler than before:
+      1. SIGTERM live Chromium/Chrome processes (lets them exit cleanly so they
+         don't leave their OWN orphaned renderer children behind — the previous
+         blind SIGKILL is what generated much of the pileup).
+      2. Brief grace, then SIGKILL any that ignored SIGTERM.
+      3. reap_zombies() so nothing lingers as <defunct>.
+    """
     if not _HAVE_PSUTIL:
+        reap_zombies()
         return
-    killed = 0
-    for proc in psutil.process_iter(["name"]):
+
+    targets = []
+    for proc in psutil.process_iter(["name", "status"]):
         name = (proc.info.get("name") or "").lower()
+        status = (proc.info.get("status") or "")
+        if status == psutil.STATUS_ZOMBIE:
+            continue  # already dead; reap_zombies() handles these
         if "chrome" in name or "chromium" in name:
-            try:
-                proc.send_signal(signal.SIGKILL)
-                killed += 1
-            except Exception:
-                pass
-    if killed:
-        print(f"  [mem] reaped {killed} orphan Chromium process(es)")
+            targets.append(proc)
+
+    for proc in targets:
+        try:
+            proc.terminate()          # SIGTERM — clean shutdown first
+        except Exception:
+            pass
+
+    gone, alive = ([], targets)
+    try:
+        gone, alive = psutil.wait_procs(targets, timeout=3)
+    except Exception:
+        pass
+
+    for proc in alive:
+        try:
+            proc.kill()               # SIGKILL the stubborn ones
+        except Exception:
+            pass
+
+    reaped = reap_zombies()
+    if targets or reaped:
+        print(f"  [mem] terminated {len(targets)} Chromium tree(s), "
+              f"reaped {reaped} defunct")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -893,18 +959,50 @@ async def _quick_state(page):
 
 
 async def _content_ready(page):
-    """Readiness signal that can't be faked by an interstitial.
+    """Readiness signal that reflects whether the AD DATA has actually painted.
 
-    Returns 'jsonld' if the server-rendered ad JSON-LD is present (only ever
-    exists on a real ad page), 'h1' if a non-empty h1 exists, else ''.
-    The caller treats a bare 'h1' as ready ONLY when no challenge is showing.
+    The old version returned ready the instant an <h1> (or a JSON-LD tag) was
+    present. Under memory pressure the title paints long before price/area/rooms,
+    so we declared 'ready', then failed extraction and burned 4 retries. Now we
+    only report ready once a genuine DETAIL signal exists:
+
+      'strong' — JSON-LD carries a numeric price, OR the price DOM container has
+                 text (this also covers legit 'Договорная' ads with no number),
+                 OR the parameter list has painted ('Общая площадь').
+      'title'  — only the title/h1 is up so far; keep waiting.
+      ''       — nothing usable yet.
     """
     try:
-        return await page.evaluate("""() => {
-            if (document.querySelector('script[type="application/ld+json"]')) return 'jsonld';
+        return await page.evaluate(r"""() => {
+            // 1) JSON-LD with a real price → strongest possible signal.
+            const blobs = document.querySelectorAll('script[type="application/ld+json"]');
+            for (const s of blobs) {
+                try {
+                    const stack = [JSON.parse(s.textContent || '{}')];
+                    while (stack.length) {
+                        const n = stack.pop();
+                        if (Array.isArray(n)) { stack.push(...n); continue; }
+                        if (n && typeof n === 'object') {
+                            if (n['@graph']) stack.push(n['@graph']);
+                            let off = n.offers;
+                            if (Array.isArray(off)) off = off[0];
+                            if (off && (off.price || off.lowPrice)) return 'strong';
+                            for (const k in n) if (typeof n[k] === 'object') stack.push(n[k]);
+                        }
+                    }
+                } catch (e) {}
+            }
+            // 2) Price container painted (covers negotiable / price-on-request).
+            const pc = document.querySelector('[data-testid="ad-price-container"]');
+            if (pc && (pc.innerText || '').trim().length > 0) return 'strong';
+            // 3) Parameter list painted.
+            const body = (document.body && document.body.innerText) || '';
+            if (body.includes('Общая площадь') || body.includes('Количество комнат'))
+                return 'strong';
+            // 4) Title only — not enough yet.
             const h = document.querySelector('h1');
-            return (h && (h.innerText || '').trim().length > 0) ? 'h1' : '';
-        }""")
+            return (h && (h.innerText || '').trim().length > 0) ? 'title' : '';
+        }""");
     except Exception:
         return ''
 
@@ -914,9 +1012,11 @@ async def wait_for_ready(page):
     interstitial if one shows up.
 
     Returns one of:
-      'ready'   — JSON-LD / h1 present, safe to extract.
+      'ready'   — price/params painted, safe to extract.
+      'partial' — the title shell rendered but detail never painted in budget;
+                  caller does a cheap reload before retrying.
       'blocked' — hard 403 / access-denied; bail fast and back off longer.
-      'timeout' — nothing usable within READY_WAIT_MS; caller retries quickly.
+      'timeout' — nothing usable at all within READY_WAIT_MS; retry quickly.
 
     This replaces the old blind sequence (wait_for_selector h1 18s →
     wait_for_param 8s → fixed sleeps → late block check), which burned ~26s+
@@ -924,16 +1024,20 @@ async def wait_for_ready(page):
     """
     deadline = time.monotonic() + READY_WAIT_MS / 1000
     challenge_until = None  # set when we first see an interstitial
+    saw_title = False       # track whether at least the shell rendered
 
     while time.monotonic() < deadline:
         title, body = await _quick_state(page)
         on_challenge = any(m in title or m in body for m in _CHALLENGE_MARKERS)
 
         signal = await _content_ready(page)
-        # JSON-LD only exists on a genuine ad page; an h1 alone is trusted only
-        # when no interstitial text is present (the challenge page has its own h1).
-        if signal == "jsonld" or (signal == "h1" and not on_challenge):
+        # 'strong' = the ad's price/params actually painted → safe to extract.
+        # A bare 'title' is NOT ready (that was the old false-positive); keep
+        # polling until the detail region shows or we time out.
+        if signal == "strong":
             return "ready"
+        if signal == "title":
+            saw_title = True
 
         if any(m in title or m in body for m in _HARD_BLOCK_MARKERS):
             return "blocked"
@@ -949,7 +1053,9 @@ async def wait_for_ready(page):
 
         await page.wait_for_timeout(400)
 
-    return "timeout"
+    # Budget exhausted. If we at least saw the title shell, report a distinct
+    # 'partial' so the caller does a cheap reload rather than a full re-nav.
+    return "partial" if saw_title else "timeout"
 
 
 async def scrape_ad(page, url, diag=False):
@@ -973,9 +1079,18 @@ async def scrape_ad(page, url, diag=False):
         # Detect blocks/challenges FAST and let CF interstitials self-resolve,
         # instead of paying ~26s of blind waits before noticing a problem.
         state = await wait_for_ready(page)
+        if state == "partial":
+            # Shell rendered but the price/params never painted in time. A cheap
+            # in-place reload (session preserved) recovers most of these without
+            # the cost of a full fresh navigation + escalating backoff.
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=60000)
+                state = await wait_for_ready(page)
+            except Exception:
+                state = "timeout"
         if state == "blocked":
             raise Exception("BLOCKED_403")
-        if state == "timeout":
+        if state in ("timeout", "partial"):
             # Nothing usable yet — surface as RENDER_FAILED so the caller does a
             # short, cheap retry rather than the old 30/60/90s block backoff.
             raise Exception("RENDER_FAILED")
@@ -1400,6 +1515,12 @@ TZ_NAME      = os.getenv("TZ_NAME", "Asia/Tashkent")
 
 
 async def _main():
+    # ROOT-CAUSE FIX: start reaping dead Chromium children immediately and
+    # forever. Without this, orphans reparented to PID 1 pile up as zombies
+    # (~600 were pinned in the logs) and starve the container, which is what
+    # produced the "Page rendered incomplete" cascade.
+    asyncio.create_task(_zombie_reaper_loop(interval=10))
+
     scheduler = AsyncIOScheduler(timezone=TZ_NAME)
     scheduler.add_job(
         run_scrape, "cron",
