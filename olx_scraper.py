@@ -82,8 +82,14 @@ AD_WAIT_MS            = (600, 1200)   # small settle once content is already rea
 READY_WAIT_MS         = int(os.getenv("READY_WAIT_MS", "15000"))   # overall ceiling to get usable content
 CHALLENGE_WAIT_MS     = int(os.getenv("CHALLENGE_WAIT_MS", "12000"))  # let a Cloudflare interstitial self-resolve
 PARAM_WAIT_MS         = int(os.getenv("PARAM_WAIT_MS", "3500"))    # bounded; many valid ads lack 'Общая площадь'
-BETWEEN_ADS           = (2.0, 4.0)    # ← the real rate limiter; raise this first if 403s rise
-BETWEEN_LIST          = (6.0, 9.0)
+# BETWEEN_ADS is the real rate limiter. Single-IP runs were seeing ~20% of
+# requests 403'd at the old (2.0, 4.0) pace, so the base is raised. On top of
+# this base, the ADAPTIVE throttle below adds extra delay whenever 403s appear
+# and removes it again once they stop — fast when OLX is happy, polite when not.
+BETWEEN_ADS           = (float(os.getenv("BETWEEN_ADS_MIN", "3.5")),
+                         float(os.getenv("BETWEEN_ADS_MAX", "6.0")))
+BETWEEN_LIST          = (float(os.getenv("BETWEEN_LIST_MIN", "8.0")),
+                         float(os.getenv("BETWEEN_LIST_MAX", "12.0")))
 LONG_BREAK_EVERY      = 22
 LONG_BREAK_SECS       = (13, 22)
 SCROLL_PASSES         = (1, 2)
@@ -93,8 +99,30 @@ BROWSER_RESTART_EVERY = int(os.getenv("BROWSER_RESTART_EVERY", "15"))
 AD_ATTEMPTS           = int(os.getenv("AD_ATTEMPTS", "4"))
 BATCH_SIZE            = 1             # save every listing immediately
 
-# Unique key for the Postgres advisory lock (any constant 32-bit int works).
-RUN_LOCK_KEY = int(os.getenv("RUN_LOCK_KEY", "916273"))
+# ── Adaptive rate control (AIMD) ──────────────────────────────────
+# On each 403 we ADD a fixed penalty to the inter-ad delay (additive increase);
+# after a streak of clean ads we shave it back down (multiplicative-ish decay).
+# This tracks OLX's tolerance automatically instead of guessing one fixed delay.
+ADAPT_STEP_UP    = float(os.getenv("ADAPT_STEP_UP", "3.0"))    # +sec added per 403
+ADAPT_MAX_EXTRA  = float(os.getenv("ADAPT_MAX_EXTRA", "20.0")) # ceiling on the penalty
+ADAPT_DECAY_EVERY = int(os.getenv("ADAPT_DECAY_EVERY", "8"))   # clean ads before we relax
+ADAPT_DECAY_STEP  = float(os.getenv("ADAPT_DECAY_STEP", "1.5"))# sec removed per relax
+
+# Unique key for the Postgres advisory lock.
+# PER-SHARD by default: derived from THIS server's OLX_BASE_URL set, so servers
+# scraping DIFFERENT urls get DIFFERENT locks and run in parallel — while two
+# instances of the SAME shard (e.g. a deploy handoff or stray replica) still
+# collide on the same key and one correctly skips. Set RUN_LOCK_KEY explicitly
+# to override (e.g. force two servers to share a lock, or pin a value).
+def _derive_run_lock_key():
+    raw = os.getenv("RUN_LOCK_KEY")
+    if raw:
+        return int(raw)
+    import hashlib
+    seed = "||".join(sorted(BASE_URLS))
+    return int(hashlib.md5(seed.encode("utf-8")).hexdigest()[:8], 16)  # 32-bit
+
+RUN_LOCK_KEY = _derive_run_lock_key()
 
 CHROMIUM_ARGS = [
     "--no-sandbox",
@@ -191,6 +219,35 @@ def location_from_title(page_title):
 
 async def short_delay(a, b):
     await asyncio.sleep(random.uniform(a, b))
+
+
+# ── Adaptive throttle state (AIMD) ────────────────────────────────
+class _Throttle:
+    extra = 0.0        # seconds currently added to every inter-ad delay
+    ok_streak = 0      # consecutive clean ads since the last 403
+
+
+def throttle_on_block():
+    """A 403 happened → widen the gap between ads (additive increase)."""
+    _Throttle.extra = min(ADAPT_MAX_EXTRA, _Throttle.extra + ADAPT_STEP_UP)
+    _Throttle.ok_streak = 0
+    print(f"  [rate] 403 seen → inter-ad delay +{ADAPT_STEP_UP:.0f}s "
+          f"(now +{_Throttle.extra:.0f}s on top of base)")
+
+
+def throttle_on_ok():
+    """A clean ad → after a streak, relax the penalty a notch."""
+    _Throttle.ok_streak += 1
+    if _Throttle.ok_streak >= ADAPT_DECAY_EVERY and _Throttle.extra > 0:
+        _Throttle.extra = max(0.0, _Throttle.extra - ADAPT_DECAY_STEP)
+        _Throttle.ok_streak = 0
+        if _Throttle.extra == 0:
+            print("  [rate] recovered → back to base pace")
+
+
+async def between_ads_delay():
+    """Base BETWEEN_ADS jitter plus the current adaptive penalty."""
+    await asyncio.sleep(random.uniform(*BETWEEN_ADS) + _Throttle.extra)
 
 
 async def human_scroll(page, fast=False):
@@ -1303,6 +1360,7 @@ async def run_scrape():
 async def _run_scrape_inner():
     print(f"\n{'='*55}")
     print(f"  SCRAPE STARTED  —  {now_str()}")
+    print(f"  shard lock key: {RUN_LOCK_KEY}  ({len(BASE_URLS)} url(s) this server)")
     print(f"{'='*55}\n")
 
     try:
@@ -1414,8 +1472,10 @@ async def _run_scrape_inner():
                             err = str(e)
                             if "BLOCKED_403" in err:
                                 # Genuine 403/access-denied (not a CF interstitial —
-                                # those are now waited out inside scrape_ad). IP may be
-                                # flagged, so cool down progressively.
+                                # those are now waited out inside scrape_ad). This is
+                                # rate-limiting: widen the pace for FUTURE ads too,
+                                # not just this retry, so we stop tripping the limiter.
+                                throttle_on_block()
                                 wait = 15 * (attempt + 1)
                                 print(f"  BLOCKED — retry {attempt+1}/{AD_ATTEMPTS} in {wait}s")
                                 await asyncio.sleep(wait)
@@ -1446,6 +1506,7 @@ async def _run_scrape_inner():
                     if skip_permanently:
                         skipped_removed += 1
                     elif data:
+                        throttle_on_ok()  # clean ad → relax the pace after a streak
                         batch_data.append(data)
                         print(
                             f"  ✓  rooms={data['num_rooms']}  area={data['area']}  "
@@ -1462,7 +1523,7 @@ async def _run_scrape_inner():
                         batch_data.clear()
 
                     await flush_page(page)
-                    await short_delay(*BETWEEN_ADS)
+                    await between_ads_delay()  # base pace + adaptive 403 penalty
 
                     if ad_counter % LONG_BREAK_EVERY == 0:
                         secs = random.uniform(*LONG_BREAK_SECS)
